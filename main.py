@@ -40,12 +40,19 @@ def analyze_stock(payload: IndicatorRequest):
         df.sort_index(inplace=True) # 確保時間依序排列
         
         # 2. 呼叫您現有的技術指標計算函式
+        
         df_out = calculate_kd_rsi_ma_macd(df)
         
-        # 3. 繪製技術指標多合一數據圖
+        # ==================== 🔴 核心修復：徹底消滅掉到 0 的線 ====================
+        # 因為計算 20MA 需要 20 天的資料，前 20 筆是指標未完成的無效資料（常常會是 0）
+        # 我們直接用 .iloc[20:] 把前 20 筆剔除掉，這樣畫圖就不會從 0 開始飆上去了！
+        df_out = df_out.iloc[20:]
+        # =========================================================================
+        
+        # 3. 繪製技術指標多合一數據圖 (接下來維持你原本的繪圖程式碼...)
         fig, axes = plt.subplots(4, 1, figsize=(11, 12), sharex=True, 
                                  gridspec_kw={'height_ratios': [2, 1, 1, 1]})
-        
+
         # 主圖：股價與均線
         axes[0].plot(df_out.index, df_out['Close'], label='Close Price', color='black', linewidth=1.5)
         axes[0].plot(df_out.index, df_out['MA_5'], label='MA 5', color='blue', linestyle='--')
