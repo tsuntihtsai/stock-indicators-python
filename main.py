@@ -1,20 +1,19 @@
 import os
 import sys
+import io
+import base64
 import pandas as pd
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-# 確保引入模組路徑正確
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from indicators.kd_rsi_ma_macd import calculate_kd_rsi_ma_macd  # 原本的舊指標函式
+from indicators.kd_rsi_ma_macd import calculate_kd_rsi_ma_macd
 from indicators.bollinger_bands import calculate_bollinger_bands
 from indicators.volume_indicators import calculate_volume_ma
 from indicators.chart_builder import draw_ultimate_chart
 
-app = FastAPI(title="Stock Indicators API for n8n")
+app = FastAPI(title="Stock Indicators Ultimate API")
 
-# 精準對接 n8n 傳來的首字大寫 JSON 欄位
 class OHLCVFM(BaseModel):
     date: str = Field(alias="Date")
     open: float = Field(alias="Open")
@@ -26,47 +25,44 @@ class OHLCVFM(BaseModel):
 class IndicatorRequestFM(BaseModel):
     data: list[OHLCVFM]
 
-@app.get("/")
-def read_root():
-    return {"status": "healthy", "message": "Stock Indicators API is running!"}
-
 @app.post("/analyze")
-def analyze_stock(payload: IndicatorRequestFM):
+def analyze_stock_v3(payload: IndicatorRequestFM):
     if not payload.data:
         raise HTTPException(status_code=400, detail="Data list cannot be empty")
         
     try:
-        # 1. 將資料轉為 DataFrame (Pydantic 預設轉成小寫欄位名)
+        # 1. 建立 DataFrame
         df = pd.DataFrame([row.model_dump() for row in payload.data])
-        
         df['date'] = pd.to_datetime(df['date'])
         df.set_index('date', inplace=True)
         df.sort_index(inplace=True)
         
-        # 🔴 修正關鍵：為了讓你原本不動的舊函式不崩潰，先將欄位更名為首字大寫
-        df.rename(columns={
-            'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'
-        }, inplace=True)
+        # 2. 迎合舊函式的大寫更名
+        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
         
-        # 2. 🟢 執行你原本的技術指標計算 (它現在能開心地看到 'High', 'Low', 'Close' 了！)
+        # 3. 執行接力計算
         df_out = calculate_kd_rsi_ma_macd(df)
-        
-        # 🔴 修正關鍵：為了配合新拆分出去的布林、量能指標與畫圖模組，我們統一將所有欄位轉回小寫
         df_out.columns = df_out.columns.str.lower()
-        
-        # 3. 🔴 依序疊加跑新檔案裡的指標計算 (吃小寫欄位)
         df_out = calculate_bollinger_bands(df_out)
         df_out = calculate_volume_ma(df_out)
         
-        # 4. 呼叫外部的純繪圖模組 (吃小寫欄位)
+        # 4. 產出圖片 buffer
         chart_buffer = draw_ultimate_chart(df_out)
         
-        return StreamingResponse(chart_buffer, media_type="image/png")
+        # 🔴 核心升級：將二進位圖檔轉為 Base64 字串，準備塞進 JSON 中
+        image_base64 = base64.b64encode(chart_buffer.getvalue()).decode('utf-8')
+        
+        # 5. 🔴 將包含高階指標的 DataFrame 轉回 JSON 字典格式 (重設索引讓日期變成欄位)
+        df_json = df_out.reset_index()
+        df_json['date'] = df_json['date'].dt.strftime('%Y-%m-%d')
+        metrics_list = df_json.to_dict(orient='records')
+        
+        # 6. 👑 雙棲回傳：同時把「新指標 JSON」與「圖片文字」打包成一個大 JSON 回傳
+        return {
+            "status": "success",
+            "image_data": f"data:image/png;base64,{image_base64}", # 圖片就在這
+            "metrics": metrics_list                               # 新指標都在這！
+        }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"API Error: {str(e)}")
-
-if __name__ == '__main__':
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
