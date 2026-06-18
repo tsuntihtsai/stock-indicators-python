@@ -52,6 +52,11 @@ def draw_ultimate_chart(df_out):
         rect = Rectangle((rect_left, bottom_y), timedelta(hours=int(24 * candle_width)), height, 
                          facecolor=color, edgecolor=color, fill=True, zorder=3)
         axes[0].add_patch(rect)
+
+     # 🔴 疊加繪製唐奇安通道 (不要畫得太粗，用 alpha=0.4 淡淡的襯托在背景即可)
+    if 'donchian_up' in df_out.columns:
+            axes[0].plot(df_out.index, df_out['donchian_up'], color='dodgerblue', linewidth=0.7, linestyle=':', alpha=0.5, label='Donchian Up')
+            axes[0].plot(df_out.index, df_out['donchian_low'], color='dodgerblue', linewidth=0.7, linestyle=':', alpha=0.5, label='Donchian Low')
         
     # 3. 主圖軌道與均線繪製 (布林通道 + MA)
     axes[0].plot(df_out.index, df_out[ma5_col], label='MA 5', color='blue', linewidth=0.8)
