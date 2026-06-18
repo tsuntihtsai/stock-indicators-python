@@ -16,7 +16,7 @@ app = FastAPI(title="Stock Indicators API for n8n")
 # 定義 n8n 傳入的資料格式
 class OHLCVRow(BaseModel):
     Date: str
-    Open: flaot
+    Open: float
     High: float
     Low: float
     Close: float
