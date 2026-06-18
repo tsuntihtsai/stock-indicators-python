@@ -16,6 +16,7 @@ app = FastAPI(title="Stock Indicators API for n8n")
 # 定義 n8n 傳入的資料格式
 class OHLCVRow(BaseModel):
     Date: str
+    Open: flaot
     High: float
     Low: float
     Close: float
@@ -70,7 +71,7 @@ def analyze_stock(payload: IndicatorRequest):
         from matplotlib.patches import Rectangle
         
         # 設定蠟燭實體的寬度 (以天數為單位，0.6 筆 K 棒寬度是最舒服、不擁擠的黃金比例)
-        candle_width = 0.6  
+        candle_width = 0.8  
         
         for idx, row in df_out.iterrows():
             o = row['Open'] if 'Open' in row else row['Close']
@@ -99,7 +100,7 @@ def analyze_stock(payload: IndicatorRequest):
             
             # 如果漲跌幅為 0 (十字線)，給予一個極小的最低高度，避免方塊完全消失
             if height == 0:
-                height = (y_max - y_min) * 0.002
+                height = (y_max - y_min) * 0.005
                 
             rect = Rectangle(
                 (rect_left, bottom_y), 
