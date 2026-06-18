@@ -4,6 +4,7 @@ from datetime import timedelta
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
+
 def draw_ultimate_chart(df_out):
     """
     純繪圖函式：接收算好指標的 DataFrame，畫出五合一看盤圖
@@ -28,7 +29,7 @@ def draw_ultimate_chart(df_out):
     fig, axes = plt.subplots(5, 1, figsize=(11, 15), sharex=True, 
                              gridspec_kw={'height_ratios': [2.8, 1.2, 1, 1, 1]})
     
-    # 自動調整主圖 Y 軸邊距
+    # 自動調整主圖 Y 軸邊距 (優先使用布林通道與唐奇安擴展邊界)
     y_min = df_out['bb_low'].dropna().min() * 0.98 if 'bb_low' in df_out.columns and not df_out['bb_low'].dropna().empty else df_out['close'].min() * 0.95
     y_max = df_out['bb_up'].dropna().max() * 1.02 if 'bb_up' in df_out.columns and not df_out['bb_up'].dropna().empty else df_out['close'].max() * 1.05
     axes[0].set_ylim(y_min, y_max)
@@ -53,19 +54,21 @@ def draw_ultimate_chart(df_out):
                          facecolor=color, edgecolor=color, fill=True, zorder=3)
         axes[0].add_patch(rect)
 
-     # 🔴 疊加繪製唐奇安通道 (不要畫得太粗，用 alpha=0.4 淡淡的襯托在背景即可)
-    if 'donchian_up' in df_out.columns:
-            axes[0].plot(df_out.index, df_out['donchian_up'], color='dodgerblue', linewidth=0.7, linestyle=':', alpha=0.5, label='Donchian Up')
-            axes[0].plot(df_out.index, df_out['donchian_low'], color='dodgerblue', linewidth=0.7, linestyle=':', alpha=0.5, label='Donchian Low')
-        
     # 3. 主圖軌道與均線繪製 (布林通道 + MA)
-    axes[0].plot(df_out.index, df_out[ma5_col], label='MA 5', color='blue', linewidth=0.8)
-    axes[0].plot(df_out.index, df_out[ma20_col], label='MA 20 (BB Mid)', color='orange', linewidth=1.0)
-    
+    # 🔴 讓背景灰色區塊先畫 (zorder=1)，這樣後面的唐奇安虛線才不會被蓋住
     if 'bb_up' in df_out.columns:
-        axes[0].plot(df_out.index, df_out['bb_up'], label='BB Upper', color='#b0b0b0', linewidth=0.8)
-        axes[0].plot(df_out.index, df_out['bb_low'], label='BB Lower', color='#b0b0b0', linewidth=0.8)
+        axes[0].plot(df_out.index, df_out['bb_up'], label='BB Upper', color='#b0b0b0', linewidth=0.8, zorder=1)
+        axes[0].plot(df_out.index, df_out['bb_low'], label='BB Lower', color='#b0b0b0', linewidth=0.8, zorder=1)
         axes[0].fill_between(df_out.index, df_out['bb_up'], df_out['bb_low'], color='#f5f5f5', alpha=0.3, zorder=1)
+
+    axes[0].plot(df_out.index, df_out[ma5_col], label='MA 5', color='blue', linewidth=0.8, zorder=4)
+    axes[0].plot(df_out.index, df_out[ma20_col], label='MA 20 (BB Mid)', color='orange', linewidth=1.0, zorder=4)
+    
+    # ==================== 🔴 修正核心：挪到這裡繪製，並提高顏色鮮明度與層級 ====================
+    if 'donchian_up' in df_out.columns:
+        axes[0].plot(df_out.index, df_out['donchian_up'], color='#00a2ff', linewidth=0.9, linestyle='--', alpha=0.7, label='Donchian Up', zorder=5)
+        axes[0].plot(df_out.index, df_out['donchian_low'], color='#00a2ff', linewidth=0.9, linestyle='--', alpha=0.7, label='Donchian Low', zorder=5)
+    # ===================================================================================
     
     axes[0].set_title('Stock Price, MA & Bollinger Bands', fontsize=12, fontweight='bold')
     axes[0].legend(loc='upper left', fontsize=9)
