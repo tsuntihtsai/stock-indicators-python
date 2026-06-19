@@ -27,8 +27,16 @@ class IndicatorRequestFM(BaseModel):
 
 @app.post("/analyze")
 def analyze_stock_v3(payload: IndicatorRequestFM):
+    # 🔴 防禦機制 1：檢查資料是否為空
     if not payload.data:
         raise HTTPException(status_code=400, detail="Data list cannot be empty")
+    
+    # 🔴 防禦機制 2：檢查資料天數是否足夠計算 20日均線與布林通道
+    if len(payload.data) < 20:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"資料天數不足！計算布林與技術指標至少需要 20 天的歷史數據，目前只有 {len(payload.data)} 天。請調整 n8n 撈取的時間區間。"
+        )
         
     try:
         # 1. 建立 DataFrame
@@ -49,20 +57,27 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         # 4. 產出圖片 buffer
         chart_buffer = draw_ultimate_chart(df_out)
         
-        # 🔴 核心升級：將二進位圖檔轉為 Base64 字串，準備塞進 JSON 中
+        # 5. 將二進位圖檔轉為 Base64 字串
         image_base64 = base64.b64encode(chart_buffer.getvalue()).decode('utf-8')
         
-        # 5. 🔴 將包含高階指標的 DataFrame 轉回 JSON 字典格式 (重設索引讓日期變成欄位)
+        # 6. 將包含高階指標的 DataFrame 轉回 JSON 字典格式
         df_json = df_out.reset_index()
         df_json['date'] = df_json['date'].dt.strftime('%Y-%m-%d')
-        metrics_list = df_json.to_dict(orient='records')
         
-        # 6. 👑 雙棲回傳：同時把「新指標 JSON」與「圖片文字」打包成一個大 JSON 回傳
+        # 🔴 為了防止 JSON 體積過大，我們只回傳「最新那一天（當天）」的指標數據給 AI Agent
+        # 如果你希望回傳整段，可以改回 df_json.to_dict(orient='records')
+        latest_metrics = df_json.tail(1).to_dict(orient='records')[0]
+        
         return {
             "status": "success",
-            "image_data": f"data:image/png;base64,{image_base64}", # 圖片就在這
-            "metrics": metrics_list                               # 新指標都在這！
+            "image_data": f"data:image/png;base64,{image_base64}",
+            "metrics": latest_metrics  # 👑 只回傳最新一天的精準指標，對 AI 來說完全足夠，且速度極快！
         }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"API Error: {str(e)}")
+
+if __name__ == '__main__':
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
