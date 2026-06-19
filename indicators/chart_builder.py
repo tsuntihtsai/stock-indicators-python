@@ -135,7 +135,7 @@ def draw_ultimate_chart(df_out):
     plt.tight_layout()
     
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=145)
+    plt.savefig(buf, format='png', dpi=90)
     buf.seek(0)
     plt.close(fig)
     return buf
