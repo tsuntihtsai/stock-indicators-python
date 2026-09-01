@@ -1,13 +1,36 @@
 import io
 import numpy as np
 from datetime import timedelta
+import matplotlib
+import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import pandas as pd
 
-def draw_ultimate_chart(df_out):
+# ==================== 中文字型設定 ====================
+# 修正說明：matplotlib 預設字型（DejaVu Sans）不支援中文字，
+# 如果股票名稱（例如「台積電」）被放進圖表標題，字會顯示成
+# 一格一格的空白方塊（missing glyph）。這裡在載入時自動偵測
+# 系統上可用的中文字型並套用，找不到就靜默略過（回到原本行為），
+# 不會讓程式報錯。
+_CJK_FONT_CANDIDATES = [
+    'Noto Sans CJK TC', 'Noto Sans CJK JP', 'Noto Sans CJK SC',
+    'Microsoft JhengHei', 'PingFang TC', 'PingFang SC', 'SimHei', 'Heiti TC'
+]
+_available_font_names = {f.name for f in fm.fontManager.ttflist}
+for _font_name in _CJK_FONT_CANDIDATES:
+    if _font_name in _available_font_names:
+        matplotlib.rcParams['font.sans-serif'] = [_font_name] + matplotlib.rcParams.get('font.sans-serif', [])
+        break
+matplotlib.rcParams['axes.unicode_minus'] = False  # 避免套用中文字型後負號顯示異常
+# =======================================================
+
+def draw_ultimate_chart(df_out, stock_label: str = ""):
     """
     終極整合繪圖函式：自動補算高階指標，並精確排列圖層畫出
+
+    stock_label: 選填，股票名稱或代號，會顯示在主圖標題上，
+    方便AI視覺辨識這張圖對應的是哪支股票（也方便使用者肉眼確認）。
     """
     # 確保資料按時間排序
     df_out = df_out.sort_index()
@@ -106,7 +129,10 @@ def draw_ultimate_chart(df_out):
         axes[0].plot(df_out.index, df_out['donchian_up'], color='#00a2ff', linewidth=1.0, linestyle='--', alpha=0.8, label='Donchian Up', zorder=5)
         axes[0].plot(df_out.index, df_out['donchian_low'], color='#00a2ff', linewidth=1.0, linestyle='--', alpha=0.8, label='Donchian Low', zorder=5)
 
-    axes[0].set_title('Stock Price, MA & Bollinger Bands', fontsize=12, fontweight='bold')
+    title_text = 'Stock Price, MA & Bollinger Bands'
+    if stock_label:
+        title_text = f'{stock_label} — {title_text}'
+    axes[0].set_title(title_text, fontsize=12, fontweight='bold')
     axes[0].legend(loc='upper left', fontsize=9)
     axes[0].grid(True, alpha=0.15)
 
@@ -153,18 +179,6 @@ def draw_ultimate_chart(df_out):
     axes[4].set_title('MACD Indicator', fontsize=10, fontweight='bold')
     axes[4].legend(loc='upper left', fontsize=8)
     axes[4].grid(True, alpha=0.15)
-
-    # ==================== 🧪 測試用視覺標記（驗證AI是否真的讀到圖片）====================
-    # 這個紫色圓圈+浮水印文字跟任何技術指標、量化數據都無關，
-    # 純粹用來測試：AI Agent 的回答如果答得出「有一個紫色圓圈」，
-    # 才能證明它真的有在「看」這張圖片本身，而不是靠文字數據腦補。
-    # 確認測試沒問題之後，把這整段刪掉即可。
-    fig.text(0.5, 0.5, 'TEST-9527', fontsize=60, color='purple',
-              alpha=0.15, ha='center', va='center', rotation=30, zorder=100)
-    test_circle = plt.Circle((0.92, 0.97), 0.02, color='purple', alpha=0.9,
-                              transform=fig.transFigure, zorder=101, clip_on=False)
-    fig.add_artist(test_circle)
-    # =====================================================================================
 
     plt.tight_layout()
 
