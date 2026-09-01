@@ -482,6 +482,19 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         # 注入主力診斷文字與交易價位建議
         latest_metrics['obv_status'] = obv_status
         latest_metrics.update(chip_info)
+        # 🐛 修正：determine_major_force() 內部有讀取這些欄位去算分數跟desc文字，
+        # 但算完之後這些「原始數字」從來沒有被放進回傳的metrics裡，
+        # 導致 n8n Prompt 模板寫 {{ $json.metrics.foreign_net_buy }} 之類的引用永遠是 undefined
+        # （雖然 major_force_desc 的文字裡有帶到這些數字，但沒有獨立的欄位可以讓Prompt直接抓）。
+        # 這裡把payload收到的原始籌碼欄位，原封不動也放進metrics輸出，供Prompt直接引用。
+        latest_metrics['foreign_net_buy'] = payload.foreign_net_buy
+        latest_metrics['trust_net_buy'] = payload.trust_net_buy
+        latest_metrics['dealer_net_buy'] = payload.dealer_net_buy
+        latest_metrics['institutional_streak_days'] = payload.institutional_streak_days
+        latest_metrics['institutional_history_days'] = payload.institutional_history_days
+        latest_metrics['institutional_net_5d'] = payload.institutional_net_5d
+        latest_metrics['institutional_net_10d'] = payload.institutional_net_10d
+        latest_metrics['institutional_net_20d'] = payload.institutional_net_20d
         latest_metrics['stock_symbol'] = payload.stock_symbol or ""
         latest_metrics['stock_name'] = payload.stock_name or ""
         latest_metrics.update(trend_info)
