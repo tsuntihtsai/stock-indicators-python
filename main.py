@@ -39,8 +39,192 @@ class OHLCVFM(BaseModel):
     broker_diff: Optional[float] = Field(default=None, alias="Broker_Diff")
 
 
+def determine_major_force(current_cmf: float, obv_status: str, payload: "IndicatorRequestFM",
+                           latest_broker_diff) -> dict:
+    """
+    綜合判斷主力籌碼動向。優先使用真實法人/融資融券資料，
+    沒有的話才退回用價量推估的 CMF/OBV，且用詞會明確標示「僅供參考」，
+    避免像之前那樣，明明沒有真實籌碼資料佐證，卻講出「主力強烈佈局」
+    這種聽起來很篤定、但其實是CMF單一指標硬套出來的結論。
+    """
+    reasons = []
+    score = 0.0
+
+    foreign = payload.foreign_net_buy
+    trust = payload.trust_net_buy
+    dealer = payload.dealer_net_buy
+    margin_chg = payload.margin_balance_change
+    short_chg = payload.short_balance_change
+
+    institutional_parts = [v for v in [foreign, trust, dealer] if v is not None]
+    institutional_total = sum(institutional_parts) if institutional_parts else None
+
+    has_legacy_broker_data = latest_broker_diff is not None and pd.notna(latest_broker_diff)
+    has_real_chip_data = (institutional_total is not None) or (margin_chg is not None) \
+        or (short_chg is not None) or has_legacy_broker_data
+
+    if institutional_total is not None:
+        if institutional_total > 0:
+            score += 1.5
+            reasons.append(f"三大法人合計買超約 {institutional_total:,.0f} 股")
+        elif institutional_total < 0:
+            score -= 1.5
+            reasons.append(f"三大法人合計賣超約 {abs(institutional_total):,.0f} 股")
+    elif has_legacy_broker_data:
+        # 向下相容：沒有三大法人細項資料時，退回用舊的 broker_diff 判斷
+        broker_diff_value = float(latest_broker_diff)
+        if broker_diff_value < 0:
+            score += 1
+            reasons.append("買賣家數差顯示大戶券商分點買超")
+        elif broker_diff_value > 0:
+            score -= 1
+            reasons.append("買賣家數差顯示散戶券商分點買超為主")
+
+    if margin_chg is not None:
+        if margin_chg > 0:
+            reasons.append(f"融資餘額增加約 {margin_chg:,.0f} 股（散戶做多槓桿增加，籌碼較不穩定）")
+        elif margin_chg < 0:
+            score += 0.5
+            reasons.append(f"融資餘額減少約 {abs(margin_chg):,.0f} 股（散戶去槓桿，籌碼趨於乾淨）")
+
+    if short_chg is not None:
+        if short_chg > 0:
+            reasons.append(f"融券餘額增加約 {short_chg:,.0f} 股（空方力道增加，但也隱含軋空潛力）")
+        elif short_chg < 0:
+            reasons.append(f"融券餘額減少約 {abs(short_chg):,.0f} 股（空方回補）")
+
+    if current_cmf > 0.1:
+        score += 1
+        reasons.append("CMF資金流量指標為正")
+    elif current_cmf < -0.1:
+        score -= 1
+        reasons.append("CMF資金流量指標為負")
+
+    if obv_status == "底背離進貨":
+        score += 1
+        reasons.append("OBV出現底背離進貨訊號")
+
+    streak_days = payload.institutional_streak_days
+    if streak_days is not None and streak_days != 0:
+        has_real_chip_data = True  # 有連續天數資料，代表使用者確實有在追蹤真實籌碼歷史
+        if streak_days > 0:
+            # 連續買超天數越多，加分越多，但設上限避免無限累加蓋過其他指標
+            streak_bonus = min(streak_days * 0.3, 1.5)
+            score += streak_bonus
+            reasons.append(f"三大法人連續買超 {streak_days} 天")
+        else:
+            streak_bonus = min(abs(streak_days) * 0.3, 1.5)
+            score -= streak_bonus
+            reasons.append(f"三大法人連續賣超 {abs(streak_days)} 天")
+
+    # 近5日/10日/20日三大法人合計買賣超：業界標準區間，同時比對短中期趨勢是否一致
+    window_defs = [("5日", payload.institutional_net_5d), ("10日", payload.institutional_net_10d),
+                   ("20日", payload.institutional_net_20d)]
+    window_signs = []
+    for label, value in window_defs:
+        if value is None:
+            continue
+        has_real_chip_data = True
+        if value > 0:
+            reasons.append(f"近{label}三大法人合計買超約 {value:,.0f} 股")
+            window_signs.append(1)
+        elif value < 0:
+            reasons.append(f"近{label}三大法人合計賣超約 {abs(value):,.0f} 股")
+            window_signs.append(-1)
+        else:
+            window_signs.append(0)
+
+    has_mixed_window_signal = False
+    if window_signs:
+        if all(s > 0 for s in window_signs):
+            score += 1.5
+            reasons.append("短中期籌碼方向一致偏多")
+        elif all(s < 0 for s in window_signs):
+            score -= 1.5
+            reasons.append("短中期籌碼方向一致偏空")
+        else:
+            # 各區間方向不一致（例如5日轉負但20日仍為正），代表多空拉鋸，不宜下定論。
+            # 這裡不只是不加分不扣分，還要強制最終結論走向「拉鋸」，
+            # 避免其他因子(今日買賣超、連續天數)的分數蓋過這個明確的矛盾訊號，
+            # 造成文字說「拉鋸」但結論卻寫「偏多/偏空」的自相矛盾。
+            has_mixed_window_signal = True
+            reasons.append("短中期籌碼方向不一致，判斷為多空拉鋸")
+
+    if has_real_chip_data:
+        if has_mixed_window_signal:
+            # 短中期方向明確衝突時，不管其他因子分數多高，都判定為拉鋸，
+            # 避免文字說「方向不一致」但結論卻寫「偏多/偏空」的自相矛盾
+            status = "籌碼多空拉鋸洗盤"
+        elif score >= 1.5:
+            status = "主力偏多佈局"
+        elif score <= -1.5:
+            status = "主力偏空撤離"
+        else:
+            status = "籌碼多空拉鋸洗盤"
+    else:
+        # 沒有任何真實籌碼資料，只能用價量推估的CMF/OBV，語氣必須保守、明確標示參考性質
+        if score >= 1:
+            status = "資金流入（僅供參考，缺乏法人籌碼資料佐證）"
+        elif score <= -1:
+            status = "資金流出（僅供參考，缺乏法人籌碼資料佐證）"
+        else:
+            status = "資金流向不明"
+
+    desc = "；".join(reasons) if reasons else "目前資料不足以判斷主力動向"
+    if not has_real_chip_data:
+        desc += "。本次判斷僅根據價量推估的CMF/OBV，並無三大法人買賣超、融資融券等真實籌碼資料佐證，僅供參考，不代表主力真實動向。"
+
+    # 就算有真實籌碼資料，如果歷史天數還很少（例如剛開始存資料），
+    # 單日或短短幾天的數字容易被一次性大單、ETF調整成分股等雜訊干擾，信心度較低。
+    # 這裡明確標示出來，避免報告用過於篤定的語氣呈現一個其實還不穩定的判斷。
+    LOW_CONFIDENCE_DAYS_THRESHOLD = 5
+    history_days = payload.institutional_history_days
+    is_low_confidence = has_real_chip_data and history_days is not None and history_days < LOW_CONFIDENCE_DAYS_THRESHOLD
+    if is_low_confidence:
+        desc += f"（注意：目前僅累積 {history_days} 天籌碼歷史，資料仍在累積中，單日或短期數字容易受一次性大單干擾，信心度較低，建議累積至少{LOW_CONFIDENCE_DAYS_THRESHOLD}個交易日以上再視為穩定趨勢判斷）"
+
+    return {
+        "major_force_status": status,
+        "major_force_desc": desc,
+        "major_force_score": round(score, 2),
+        "has_real_chip_data": has_real_chip_data,
+        "is_low_confidence_chip_data": is_low_confidence,
+    }
+
+
 class IndicatorRequestFM(BaseModel):
     data: List[OHLCVFM]
+    stock_symbol: Optional[str] = Field(default=None, description="股票代號，例如 2330")
+    stock_name: Optional[str] = Field(default=None, description="股票名稱，例如 台積電")
+
+    # 真實籌碼面資料（選填）。可從證交所/櫃買中心公開資料免費取得：
+    # - 三大法人買賣超：https://www.twse.com.tw/zh/trading/foreign/bfi82u.html (TWSE OpenAPI也有對應端點)
+    # - 融資融券餘額：https://www.twse.com.tw/zh/trading/margin/mi-margin.html
+    # 單位皆為「股數」，正值代表買超/增加，負值代表賣超/減少。
+    foreign_net_buy: Optional[float] = Field(default=None, description="外資當日買賣超股數")
+    trust_net_buy: Optional[float] = Field(default=None, description="投信當日買賣超股數")
+    dealer_net_buy: Optional[float] = Field(default=None, description="自營商當日買賣超股數")
+    margin_balance_change: Optional[float] = Field(default=None, description="融資餘額當日增減股數")
+    short_balance_change: Optional[float] = Field(default=None, description="融券餘額當日增減股數")
+
+    # 連續買賣超天數（選填）。正值代表連續買超天數，負值代表連續賣超天數，0代表持平或無資料。
+    # 由於三大法人買賣超的官方API通常只提供「最新一天」的快照、沒有回溯查詢功能，
+    # 這個天數需要使用者自行每天存檔累積歷史後計算出來，再傳進來。
+    institutional_streak_days: Optional[int] = Field(default=None, description="三大法人合計連續買超(正)/賣超(負)天數")
+
+    # 目前累積了幾天的籌碼歷史資料（選填）。
+    # 單日籌碼數據容易受一次性大單、ETF調整成分股等雜訊干擾，信心度較低；
+    # 這個欄位讓 main.py 可以判斷歷史資料夠不夠多，資料太少時會在報告裡明確標示「僅供初步參考」。
+    institutional_history_days: Optional[int] = Field(default=None, description="目前累積的籌碼歷史天數")
+
+    # 近5日/10日/20日三大法人合計買賣超（選填，單位：股）。
+    # 這是台股籌碼分析業界慣用的標準區間（跟Yahoo股市、玩股網等平台的「法人進出」頁面一致），
+    # 用來同時比對短期(5日)、中短期(10日)、中期(20日)的買賣超方向是否一致：
+    # 三個區間同方向 → 趨勢較明確；方向不一致（例如5日轉負但20日仍為正）→ 判斷為多空拉鋸，
+    # 而不是只看單日或隨便一個區間就下定論。
+    institutional_net_5d: Optional[float] = Field(default=None, description="近5個交易日三大法人合計買賣超股數")
+    institutional_net_10d: Optional[float] = Field(default=None, description="近10個交易日三大法人合計買賣超股數")
+    institutional_net_20d: Optional[float] = Field(default=None, description="近20個交易日三大法人合計買賣超股數")
 
 
 @app.get("/")
@@ -272,34 +456,8 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         df_out['cmf'] = df_out['cmf'].fillna(0)
         current_cmf = float(df_out['cmf'].iloc[-1])
 
-        # (3) 主力進出動向判定
-        # 改動：不再用寫死的 broker_diff_mock = -120（那會讓其中一個分支永遠不可能觸發）。
-        # 若使用者有透過 payload 傳入真實 broker_diff，就用真實值；
-        # 沒有的話，只依 CMF 判斷，並在文字中誠實標示「籌碼資料不足」。
-        has_real_broker_data = latest_broker_diff is not None and pd.notna(latest_broker_diff)
-        broker_diff_value = float(latest_broker_diff) if has_real_broker_data else None
-
-        if has_real_broker_data:
-            if current_cmf > 0.1 and broker_diff_value < 0:
-                major_force_status = "主力強烈佈局進場"
-                major_force_desc = "資金流量與買賣家數差同步顯示大戶進場，籌碼有集中跡象，但仍需搭配成交量與後續走勢確認。"
-            elif current_cmf < -0.1 and broker_diff_value > 0:
-                major_force_status = "主力高檔撤離走人"
-                major_force_desc = "資金呈現淨流出，且買賣家數差顯示散戶承接為主，需留意籌碼鬆動風險。"
-            else:
-                major_force_status = "籌碼多空拉鋸洗盤"
-                major_force_desc = "目前資金流量與買賣家數差未同步指向單一方向，建議靜待籌碼進一步集中。"
-        else:
-            # 沒有真實籌碼資料時，只用 CMF 判斷，且明確標示資料不足
-            if current_cmf > 0.1:
-                major_force_status = "資金流入（僅供參考）"
-                major_force_desc = "CMF資金流量指標偏多，但缺乏買賣家數差等籌碼資料佐證，判斷僅供參考。"
-            elif current_cmf < -0.1:
-                major_force_status = "資金流出（僅供參考）"
-                major_force_desc = "CMF資金流量指標偏空，但缺乏買賣家數差等籌碼資料佐證，判斷僅供參考。"
-            else:
-                major_force_status = "資金流向不明"
-                major_force_desc = "CMF資金流量指標無明顯方向，且缺乏買賣家數差等籌碼資料。"
+        # (3) 主力進出動向判定（改用 determine_major_force，整合三大法人/融資融券真實資料）
+        chip_info = determine_major_force(current_cmf, obv_status, payload, latest_broker_diff)
         # =================================================================
 
         # (4) 趨勢偏多/偏空判斷（均線交叉 + MACD動能 + RSI過熱過冷）
@@ -309,7 +467,9 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         trade_levels = calculate_trade_levels(df_out, trend_info=trend_info)
 
         # 5. 繪製圖表
-        chart_buffer = draw_ultimate_chart(df_out)
+        stock_label_parts = [p for p in [payload.stock_symbol, payload.stock_name] if p]
+        stock_label = " ".join(stock_label_parts)
+        chart_buffer = draw_ultimate_chart(df_out, stock_label=stock_label)
 
         # 6. 圖檔轉 Base64 字串
         image_base64 = base64.b64encode(chart_buffer.getvalue()).decode('utf-8')
@@ -321,9 +481,9 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
 
         # 注入主力診斷文字與交易價位建議
         latest_metrics['obv_status'] = obv_status
-        latest_metrics['major_force_status'] = major_force_status
-        latest_metrics['major_force_desc'] = major_force_desc
-        latest_metrics['has_real_broker_data'] = has_real_broker_data
+        latest_metrics.update(chip_info)
+        latest_metrics['stock_symbol'] = payload.stock_symbol or ""
+        latest_metrics['stock_name'] = payload.stock_name or ""
         latest_metrics.update(trend_info)
         latest_metrics.update(trade_levels)
 
