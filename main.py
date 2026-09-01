@@ -204,8 +204,13 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
     if not payload.data:
         raise HTTPException(status_code=400, detail="Data list cannot be empty")
 
-    if len(payload.data) < 20:
-        raise HTTPException(status_code=400, detail="Data length must be at least 20 days")
+    if len(payload.data) < 45:
+        # 提高門檻的原因：chart_builder.py 會把前20天的 MA/KD/RSI/布林/唐奇安
+        # 全部設為 NaN（避免顯示暖機期不準確的數值）。如果資料筆數太接近20天，
+        # 扣掉這前20天之後，圖上幾乎沒有資料可畫，會變成一張看起來很奇怪、
+        # 大片空白的圖（這也是你之前看到的「鳥圖」的真正原因）。
+        # 45天可以確保扣掉20天暖機期後，還有至少25天足夠畫出有意義的走勢圖。
+        raise HTTPException(status_code=400, detail="Data length must be at least 45 days for a meaningful chart")
 
     try:
         # 1. 建立 DataFrame
