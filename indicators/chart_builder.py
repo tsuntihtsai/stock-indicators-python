@@ -154,6 +154,18 @@ def draw_ultimate_chart(df_out):
     axes[4].legend(loc='upper left', fontsize=8)
     axes[4].grid(True, alpha=0.15)
 
+    # ==================== 🧪 測試用視覺標記（驗證AI是否真的讀到圖片）====================
+    # 這個紫色圓圈+浮水印文字跟任何技術指標、量化數據都無關，
+    # 純粹用來測試：AI Agent 的回答如果答得出「有一個紫色圓圈」，
+    # 才能證明它真的有在「看」這張圖片本身，而不是靠文字數據腦補。
+    # 確認測試沒問題之後，把這整段刪掉即可。
+    fig.text(0.5, 0.5, 'TEST-9527', fontsize=60, color='purple',
+              alpha=0.15, ha='center', va='center', rotation=30, zorder=100)
+    test_circle = plt.Circle((0.92, 0.97), 0.02, color='purple', alpha=0.9,
+                              transform=fig.transFigure, zorder=101, clip_on=False)
+    fig.add_artist(test_circle)
+    # =====================================================================================
+
     plt.tight_layout()
 
     buf = io.BytesIO()
