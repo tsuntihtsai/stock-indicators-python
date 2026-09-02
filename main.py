@@ -229,7 +229,16 @@ class IndicatorRequestFM(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "healthy", "message": "Stock Indicators API is running!"}
+    return {
+        "status": "healthy",
+        "message": "Stock Indicators API is running!",
+        # 版本標記：每次重大修改main.py後更新這個字串，
+        # 部署完成後直接瀏覽器打開這支API的根目錄網址（例如
+        # https://tsuntih-stock.zeabur.app/），
+        # 看這裡的版本字串有沒有變成最新的，比每次都跑完整/analyze測試快很多，
+        # 也能立刻判斷「到底是main.py沒改對，還是部署沒生效」。
+        "version": "2026-09-01-candlestick-volume-price-riskfix"
+    }
 
 
 def determine_trend_bias(latest: pd.Series, weights: Optional[dict] = None) -> dict:
@@ -307,17 +316,138 @@ def determine_trend_bias(latest: pd.Series, weights: Optional[dict] = None) -> d
     }
 
 
+def detect_candlestick_patterns(df_out: pd.DataFrame) -> dict:
+    """
+    用規則型邏輯辨識最新一根K棒（必要時搭配前一根）的常見型態，
+    避免完全交給AI「用眼睛看圖」猜測型態名稱（容易誤判或講不出具體根據）。
+    這是簡化版規則，判斷依據是實體與影線長度的相對比例，不是嚴謹的量化回測工具。
+    """
+    latest = df_out.iloc[-1]
+    o, h, l, c = float(latest['open']), float(latest['high']), float(latest['low']), float(latest['close'])
+    body = abs(c - o)
+    candle_range = (h - l) if (h - l) > 0 else 0.0001
+    upper_shadow = h - max(o, c)
+    lower_shadow = min(o, c) - l
+    body_ratio = body / candle_range
+
+    patterns = []
+
+    if body_ratio < 0.1:
+        patterns.append("十字線（Doji）：實體極小，多空拉鋸激烈，方向尚未明朗")
+
+    if upper_shadow > body * 2 and upper_shadow > lower_shadow:
+        if c > o:
+            patterns.append("長上影線：盤中一度走高但被賣壓打回，上檔壓力沉重")
+        else:
+            patterns.append("流星型態：高檔賣壓明顯，若出現在相對高點需留意反轉")
+
+    if lower_shadow > body * 2 and lower_shadow > upper_shadow:
+        if c > o:
+            patterns.append("鎚子線：盤中一度殺低但拉回收復，若出現在相對低點具止跌意義")
+        else:
+            patterns.append("長下影線：低點出現買盤承接，留意是否止穩")
+
+    if body_ratio > 0.85:
+        if c > o:
+            patterns.append("長紅棒（近似光頭光腳）：買盤全場強勢主導")
+        else:
+            patterns.append("長黑棒（近似光頭光腳）：賣盤全場強勢主導")
+
+    if len(df_out) >= 2:
+        prev = df_out.iloc[-2]
+        po, pc = float(prev['open']), float(prev['close'])
+        if c > o and po > pc and c > po and o < pc:
+            patterns.append("看漲吞噬：今日紅K完全吞沒昨日黑K實體，具短線反轉訊號")
+        elif c < o and pc > po and o > pc and c < po:
+            patterns.append("看跌吞噬：今日黑K完全吞沒昨日紅K實體，具短線反轉訊號")
+
+    if not patterns:
+        patterns.append("無明顯特殊型態，屬一般漲跌K棒，型態上無額外訊號")
+
+    return {"candlestick_patterns": patterns}
+
+
+def analyze_volume_price_relation(df_out: pd.DataFrame) -> dict:
+    """
+    判斷最新一天的「量價關係」：價漲量增/價漲量縮/價跌量增/價跌量縮，
+    這是技術分析裡驗證「這根K棒的漲跌有沒有量能支撐」的標準做法，
+    比單純講「量能穩定」這種模糊詞更有判斷依據。
+    """
+    if len(df_out) < 2:
+        return {"volume_price_label": "資料不足", "volume_price_desc": "資料筆數不足，無法比較前一日", "volume_ratio_vs_ma5": None}
+
+    latest = df_out.iloc[-1]
+    prev_close = float(df_out['close'].iloc[-2])
+    price_change = float(latest['close']) - prev_close
+
+    volume = latest.get('volume')
+    v_ma5 = latest.get('v_ma5')
+    volume_ratio = None
+    if volume is not None and v_ma5 is not None and pd.notna(v_ma5) and v_ma5 > 0:
+        volume_ratio = float(volume) / float(v_ma5)
+
+    if volume_ratio is None:
+        return {"volume_price_label": "資料不足", "volume_price_desc": "缺乏5日均量資料，無法判斷量能是否放大", "volume_ratio_vs_ma5": None}
+
+    price_up = price_change > 0
+    volume_expanding = volume_ratio > 1.1
+    volume_shrinking = volume_ratio < 0.9
+
+    if price_up and volume_expanding:
+        label, desc = "價漲量增", "價量同步走揚，換手積極，短線動能有量能支撐"
+    elif price_up and volume_shrinking:
+        label, desc = "價漲量縮", "價格上漲但量能未同步放大，追價意願不足，若是突破訊號則真實性需保留觀察"
+    elif (not price_up) and volume_expanding:
+        label, desc = "價跌量增", "下跌伴隨放量，賣壓沉重，需留意是否有進一步破底風險"
+    elif (not price_up) and volume_shrinking:
+        label, desc = "價跌量縮", "下跌但量能萎縮，賣壓趨緩，可能進入惜售整理格局"
+    else:
+        label, desc = "價量普通", "價格與量能變化都不明顯，暫無特殊量價訊號"
+
+    return {"volume_price_label": label, "volume_price_desc": desc, "volume_ratio_vs_ma5": round(volume_ratio, 2)}
+
+
+def determine_breakout_risk_warning(latest: pd.Series) -> Optional[str]:
+    """
+    當RSI過熱、KD死亡交叉同時出現時，代表指標已經偏向超買、動能出現轉弱跡象。
+    這種情況下如果策略是「站上前高/壓力位再進場」的突破追價邏輯，
+    假突破（跌破前高後又拉回、俗稱被巴）的失敗率會比正常情況更高，
+    這個提醒不能省略，否則報告會給人「指標超買中還敢建議追突破」的錯誤印象。
+    """
+    rsi = latest.get('rsi')
+    k_val = latest.get('%k')
+    d_val = latest.get('%d')
+
+    triggers = []
+    if pd.notna(rsi) and rsi >= 70:
+        triggers.append("RSI已達過熱區(>=70)")
+    if pd.notna(k_val) and pd.notna(d_val) and k_val < d_val:
+        triggers.append("KD呈死亡交叉")
+
+    if len(triggers) >= 1:
+        return ("、".join(triggers) + "。此時若採取「突破前高/壓力位再進場」的策略，"
+                "追高的假突破風險高於平常，建議等待量能同步放大確認、或指標回檔整理後再評估，"
+                "不宜見高點被觸及就直接視為進場訊號。")
+    return None
+
+
 def calculate_trade_levels(df_out: pd.DataFrame, trend_info: Optional[dict] = None) -> dict:
     """
     根據 ATR / Donchian 通道 / 布林通道，計算一組風險報酬型的
-    建議進場價、停損價、目標價。trend_info（來自 determine_trend_bias）
-    只會用來調整 trade_note 的文字提醒，不會改變數字算法本身。
+    參考價位（entry_price / stop_loss / target_price_1 / target_price_2）。
+    trend_info（來自 determine_trend_bias）只會用來調整 trade_note 的文字提醒，
+    不會改變數字算法本身。
 
-    這是「規則型試算」，不是預測漲跌，也不是投資建議：
-    - entry_price：以現價為基準
+    這是「規則型試算」，不是預測漲跌，也不是投資建議，也不是「現在進場」的訊號：
+    - entry_price：現價，純粹是風控試算的基準點，不代表「建議現在進場」。
+      是否真的要進場，要看 trend_bias / major_force_status / 圖表視覺是否共同支持，
+      這幾個判斷是分開計算的，entry_price 本身不包含任何「該不該進場」的資訊。
     - stop_loss：現價 - 1.5倍ATR，和近10日低點取較高者（避免停損設太遠）
-    - target_price_1：以 2倍風險報酬比（2R）反推
-    - target_price_2：近期壓力位（Donchian上緣 / 布林上軌，取較保守者）
+    - target_price_1：以 2倍風險報酬比（2R）反推，risk_reward_ratio 對應的正是這個目標價
+    - target_price_2：近期壓力位（Donchian上緣 / 布林上軌，取較保守者），
+      這是「價格圖表上的壓力關卡」，不是用風險報酬比反推出來的目標，
+      所以另外提供 risk_reward_ratio_2，避免像之前那樣，
+      報告同時列出兩個目標價、卻只講一個風報比，讓人誤以為兩個目標價的風報比是一樣的。
 
     布林通道欄位對應 calculate_bollinger_bands() 實際輸出：
     bb_mid（中軌）、bb_up（上軌）、bb_low（下軌）。
@@ -331,10 +461,13 @@ def calculate_trade_levels(df_out: pd.DataFrame, trend_info: Optional[dict] = No
     if atr is None or atr <= 0:
         return {
             "entry_price": round(current_price, 2),
+            "entry_price_note": "此為現價，僅供風控試算基準，不代表建議現在進場",
             "stop_loss": None,
             "target_price_1": None,
             "target_price_2": None,
             "risk_reward_ratio": None,
+            "risk_reward_ratio_2": None,
+            "breakout_risk_warning": None,
             "trade_note": "ATR 資料不足（需至少14天資料才能計算），無法給出風險報酬建議"
         }
 
@@ -363,22 +496,37 @@ def calculate_trade_levels(df_out: pd.DataFrame, trend_info: Optional[dict] = No
     if target_price_1 is not None and risk > 0:
         risk_reward_ratio = round((target_price_1 - entry_price) / risk, 2)
 
+    # target_price_2 是「壓力關卡價位」，不是用固定風報比反推出來的，
+    # 所以要另外算一個對應target_price_2的風報比，跟target_price_1的風報比分開標示，
+    # 避免報告誤把「風險報酬比2」套用到target_price_2上。
+    risk_reward_ratio_2 = None
+    if target_price_2 is not None and risk > 0:
+        risk_reward_ratio_2 = round((target_price_2 - entry_price) / risk, 2)
+
+    breakout_risk_warning = determine_breakout_risk_warning(latest)
+
     note_parts = [
-        "此為量化規則試算（進場=現價、停損=1.5倍ATR或近期低點、目標=2倍風險或近期壓力位），僅供參考，非投資建議"
+        "此為量化規則試算（entry_price=現價、停損=1.5倍ATR或近期低點、目標①=2倍風險反推、目標②=近期壓力位），"
+        "僅供風控試算參考，非投資建議，entry_price不代表建議現在進場"
     ]
     if trend_info:
         if trend_info.get("trend_bias") == "偏空":
             note_parts.append("目前趨勢判斷偏空，若考慮做多進場需格外謹慎")
         if trend_info.get("overbought_oversold"):
             note_parts.append(trend_info["overbought_oversold"])
+    if breakout_risk_warning:
+        note_parts.append(breakout_risk_warning)
     note_parts.append("實際下單請自行評估風險")
 
     return {
         "entry_price": round(entry_price, 2),
+        "entry_price_note": "此為現價，僅供風控試算基準，不代表建議現在進場",
         "stop_loss": round(stop_loss, 2),
         "target_price_1": round(target_price_1, 2) if target_price_1 is not None else None,
         "target_price_2": round(target_price_2, 2) if target_price_2 is not None else None,
         "risk_reward_ratio": risk_reward_ratio,
+        "risk_reward_ratio_2": risk_reward_ratio_2,
+        "breakout_risk_warning": breakout_risk_warning,
         "trade_note": "；".join(note_parts)
     }
 
@@ -466,6 +614,10 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         # (5) 進場價 / 停損價 / 目標價（文字提醒會參考趨勢判斷）
         trade_levels = calculate_trade_levels(df_out, trend_info=trend_info)
 
+        # (6) K線型態辨識 + 量價關係分析（規則型判斷，補強圖表視覺解讀的具體依據）
+        candlestick_info = detect_candlestick_patterns(df_out)
+        volume_price_info = analyze_volume_price_relation(df_out)
+
         # 5. 繪製圖表
         stock_label_parts = [p for p in [payload.stock_symbol, payload.stock_name] if p]
         stock_label = " ".join(stock_label_parts)
@@ -499,6 +651,8 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         latest_metrics['stock_name'] = payload.stock_name or ""
         latest_metrics.update(trend_info)
         latest_metrics.update(trade_levels)
+        latest_metrics.update(candlestick_info)
+        latest_metrics.update(volume_price_info)
 
         return {
             "status": "success",
