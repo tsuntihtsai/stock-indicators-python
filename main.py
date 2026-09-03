@@ -237,7 +237,7 @@ def read_root():
         # https://tsuntih-stock.zeabur.app/），
         # 看這裡的版本字串有沒有變成最新的，比每次都跑完整/analyze測試快很多，
         # 也能立刻判斷「到底是main.py沒改對，還是部署沒生效」。
-        "version": "2026-09-01-candlestick-volume-price-riskfix"
+        "version": "2026-09-02-entry-strategy-suggestion"
     }
 
 
@@ -431,6 +431,81 @@ def determine_breakout_risk_warning(latest: pd.Series) -> Optional[str]:
     return None
 
 
+def suggest_entry_strategy(latest: pd.Series, trend_info: dict, breakout_warning: Optional[str]) -> dict:
+    """
+    給出一個「真正有分析含量」的建議進場價/策略，取代單純把現價當成進場價的舊做法。
+
+    核心邏輯：不是所有情況都建議「現在進場」，而是依照目前位置分成三種策略：
+    1. 突破進場：趨勢偏多、但股價還沒站上關鍵壓力位 → 建議「站上OO再進場」，現在不追價
+    2. 拉回進場：指標過熱/死叉，或趨勢中性不明確 → 建議「拉回到OO支撐不破再進場」，不追高
+    3. 現價可進場：趨勢偏多，且已經站穩主要壓力之上、也沒有過熱警訊 → 現價才真正具備進場條件
+
+    這仍然是規則型判斷，不是預測，也不保證進場後一定獲利，只是把「什麼情況下才建議進場」
+    講得比「現價=建議進場價」更有依據、更誠實。
+    """
+    close = float(latest['close'])
+    bb_mid = latest.get('bb_mid')
+    bb_up = latest.get('bb_up')
+    donchian_up = latest.get('donchian_up')
+    ma5 = latest.get('ma_5')
+    ma20 = latest.get('ma_20')
+    trend_bias = trend_info.get('trend_bias')
+
+    def _clean(v):
+        return float(v) if v is not None and pd.notna(v) else None
+
+    bb_mid, bb_up, donchian_up, ma5, ma20 = map(_clean, [bb_mid, bb_up, donchian_up, ma5, ma20])
+
+    # 情況1：指標過熱/死叉 → 不建議追高，改建議等拉回
+    if breakout_warning:
+        support_candidates = [v for v in [ma5, ma20, bb_mid] if v is not None and v < close]
+        pullback_ref = max(support_candidates) if support_candidates else None
+        return {
+            "suggested_entry_type": "拉回進場",
+            "suggested_entry_price": round(pullback_ref, 2) if pullback_ref is not None else None,
+            "suggested_entry_note": (
+                f"指標已偏向過熱/死叉，不建議現在追高，建議等股價拉回至約 {round(pullback_ref, 2) if pullback_ref is not None else '支撐區'} 附近且不破，再考慮進場"
+            )
+        }
+
+    # 情況2：趨勢偏多，但還沒站上關鍵壓力 → 建議站上壓力再進場（突破進場）
+    if trend_bias == "偏多":
+        resistance_candidates = [v for v in [bb_up, donchian_up] if v is not None and v > close]
+        if resistance_candidates:
+            trigger = min(resistance_candidates)
+            return {
+                "suggested_entry_type": "突破進場",
+                "suggested_entry_price": round(trigger, 2),
+                "suggested_entry_note": f"若股價帶量站穩 {round(trigger, 2)} 之上，可視為偏多訊號進場；目前尚未站上此關卡，不建議現在追價"
+            }
+        # 情況3：已經站穩所有壓力之上，趨勢偏多又沒有過熱警訊 → 現價才真正具備進場條件
+        return {
+            "suggested_entry_type": "現價可進場",
+            "suggested_entry_price": round(close, 2),
+            "suggested_entry_note": "股價已站穩主要壓力關卡之上，趨勢偏多且無即時過熱疑慮，現價具備進場條件（仍請自行搭配停損執行）"
+        }
+
+    # 情況4：趨勢偏空 → 不建議做多進場
+    if trend_bias == "偏空":
+        return {
+            "suggested_entry_type": "觀望",
+            "suggested_entry_price": None,
+            "suggested_entry_note": "目前趨勢偏空，不建議進場做多，請等待止跌訊號出現後再評估"
+        }
+
+    # 情況5：中性/不明確 → 建議等拉回或等訊號更明確
+    support_candidates = [v for v in [ma20, bb_mid] if v is not None and v < close]
+    pullback_ref = max(support_candidates) if support_candidates else None
+    return {
+        "suggested_entry_type": "觀望/等待轉折",
+        "suggested_entry_price": round(pullback_ref, 2) if pullback_ref is not None else None,
+        "suggested_entry_note": (
+            f"目前趨勢不明確，建議等股價拉回至約 {round(pullback_ref, 2) if pullback_ref is not None else '支撐區'} "
+            "或出現更明確的轉折訊號後，再考慮進場"
+        )
+    }
+
+
 def calculate_trade_levels(df_out: pd.DataFrame, trend_info: Optional[dict] = None) -> dict:
     """
     根據 ATR / Donchian 通道 / 布林通道，計算一組風險報酬型的
@@ -618,6 +693,10 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         candlestick_info = detect_candlestick_patterns(df_out)
         volume_price_info = analyze_volume_price_relation(df_out)
 
+        # (7) 建議進場策略：根據趨勢位置給出「突破進場/拉回進場/現價可進場/觀望」的具體建議，
+        # 取代單純把現價當成建議進場價的舊做法
+        entry_strategy = suggest_entry_strategy(df_out.iloc[-1], trend_info, trade_levels.get('breakout_risk_warning'))
+
         # 5. 繪製圖表
         stock_label_parts = [p for p in [payload.stock_symbol, payload.stock_name] if p]
         stock_label = " ".join(stock_label_parts)
@@ -653,6 +732,7 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         latest_metrics.update(trade_levels)
         latest_metrics.update(candlestick_info)
         latest_metrics.update(volume_price_info)
+        latest_metrics.update(entry_strategy)
 
         return {
             "status": "success",
