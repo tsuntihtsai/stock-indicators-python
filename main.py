@@ -237,7 +237,7 @@ def read_root():
         # https://tsuntih-stock.zeabur.app/），
         # 看這裡的版本字串有沒有變成最新的，比每次都跑完整/analyze測試快很多，
         # 也能立刻判斷「到底是main.py沒改對，還是部署沒生效」。
-        "version": "2026-09-02-bearish-target-disclaimer"
+        "version": "2026-09-02-support-candidates-fix"
     }
 
 
@@ -446,7 +446,9 @@ def suggest_entry_strategy(latest: pd.Series, trend_info: dict, breakout_warning
     close = float(latest['close'])
     bb_mid = latest.get('bb_mid')
     bb_up = latest.get('bb_up')
+    bb_low = latest.get('bb_low')
     donchian_up = latest.get('donchian_up')
+    donchian_low = latest.get('donchian_low')
     ma5 = latest.get('ma_5')
     ma20 = latest.get('ma_20')
     trend_bias = trend_info.get('trend_bias')
@@ -454,11 +456,18 @@ def suggest_entry_strategy(latest: pd.Series, trend_info: dict, breakout_warning
     def _clean(v):
         return float(v) if v is not None and pd.notna(v) else None
 
-    bb_mid, bb_up, donchian_up, ma5, ma20 = map(_clean, [bb_mid, bb_up, donchian_up, ma5, ma20])
+    bb_mid, bb_up, bb_low, donchian_up, donchian_low, ma5, ma20 = map(
+        _clean, [bb_mid, bb_up, bb_low, donchian_up, donchian_low, ma5, ma20]
+    )
 
     # 情況1：指標過熱/死叉 → 不建議追高，改建議等拉回
+    # 🐛 修正：原本只考慮 ma5/ma20/bb_mid 當支撐候選，股價強烈下跌、
+    # 已經跌破所有均線時（例如剛出現長黑棒重挫），這三個候選可能全部高於現價、
+    # 一個都選不到，導致「建議進場價」變成完全空白（只顯示「支撐區」這種空話）。
+    # 這裡把 bb_low（布林下軌）、donchian_low（20日低點）也納入候選，
+    # 確保股價已經跌破短期均線時，還有更下方的支撐關卡可以參考。
     if breakout_warning:
-        support_candidates = [v for v in [ma5, ma20, bb_mid] if v is not None and v < close]
+        support_candidates = [v for v in [ma5, ma20, bb_mid, bb_low, donchian_low] if v is not None and v < close]
         pullback_ref = max(support_candidates) if support_candidates else None
         return {
             "suggested_entry_type": "拉回進場",
@@ -493,8 +502,8 @@ def suggest_entry_strategy(latest: pd.Series, trend_info: dict, breakout_warning
             "suggested_entry_note": "目前趨勢偏空，不建議進場做多，請等待止跌訊號出現後再評估"
         }
 
-    # 情況5：中性/不明確 → 建議等拉回或等訊號更明確
-    support_candidates = [v for v in [ma20, bb_mid] if v is not None and v < close]
+    # 情況5：中性/不明確 → 建議等拉回或等訊號更明確（同樣加入bb_low/donchian_low當候選）
+    support_candidates = [v for v in [ma20, bb_mid, bb_low, donchian_low] if v is not None and v < close]
     pullback_ref = max(support_candidates) if support_candidates else None
     return {
         "suggested_entry_type": "觀望/等待轉折",
