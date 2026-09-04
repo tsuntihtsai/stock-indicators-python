@@ -238,7 +238,7 @@ def read_root():
         # https://tsuntih-stock.zeabur.app/），
         # 看這裡的版本字串有沒有變成最新的，比每次都跑完整/analyze測試快很多，
         # 也能立刻判斷「到底是main.py沒改對，還是部署沒生效」。
-        "version": "2026-09-04-williams-bias-adx-bbwidth"
+        "version": "2026-09-04-divergence-capitulation-rolloff-only"
     }
 
 
@@ -444,6 +444,163 @@ def determine_band_squeeze(df_out: pd.DataFrame) -> dict:
         note = f"目前布林通道寬度({round(float(current_width), 2)}%)未處於收縮狀態，波動率屬正常範圍"
 
     return {"bb_width": round(float(current_width), 2), "bb_squeeze": is_squeeze, "bb_squeeze_note": note}
+
+
+def detect_divergence(df_out: pd.DataFrame, lookback: int = 40, split: int = 15) -> dict:
+    """
+    簡化版背離偵測：把最近 lookback 天分成「近期」跟「先前」兩段，
+    分別找出這兩段各自的最低點(判斷底背離)/最高點(判斷頂背離)，
+    比較價格與指標(RSI/MACD柱狀值)在這兩個低點/高點上是否方向不一致(背離)。
+
+    底背離：股價創新低，但指標未同步破底 → 市場常視為較扎實的反轉預警訊號
+    頂背離：股價創新高，但指標未同步創高 → 動能可能已經開始減弱
+
+    這是簡化版判斷（用區間內最低/最高點簡化代替嚴謹的波段高低點演算法），
+    能抓出多數常見的背離情境，但不是100%嚴謹的技術分析工具，僅供參考。
+    """
+    if len(df_out) < lookback:
+        return {"divergence_signal": None, "divergence_note": "資料不足，無法判斷是否存在背離"}
+
+    recent = df_out.tail(split)
+    prior = df_out.iloc[-lookback:-split]
+
+    if prior.empty or recent.empty:
+        return {"divergence_signal": None, "divergence_note": "資料不足，無法判斷是否存在背離"}
+
+    # --- 底背離 (Bullish Divergence)：價格創新低，但指標未創新低 ---
+    recent_low_idx = recent['close'].idxmin()
+    prior_low_idx = prior['close'].idxmin()
+    recent_low_price = recent.loc[recent_low_idx, 'close']
+    prior_low_price = prior.loc[prior_low_idx, 'close']
+    recent_low_rsi = recent.loc[recent_low_idx, 'rsi'] if 'rsi' in recent.columns else None
+    prior_low_rsi = prior.loc[prior_low_idx, 'rsi'] if 'rsi' in prior.columns else None
+    recent_low_macd = recent.loc[recent_low_idx, 'macd_hist'] if 'macd_hist' in recent.columns else None
+    prior_low_macd = prior.loc[prior_low_idx, 'macd_hist'] if 'macd_hist' in prior.columns else None
+
+    bullish_rsi_div = (pd.notna(recent_low_rsi) and pd.notna(prior_low_rsi)
+                       and recent_low_price < prior_low_price and recent_low_rsi > prior_low_rsi)
+    bullish_macd_div = (pd.notna(recent_low_macd) and pd.notna(prior_low_macd)
+                        and recent_low_price < prior_low_price and recent_low_macd > prior_low_macd)
+
+    # --- 頂背離 (Bearish Divergence)：價格創新高，但指標未創新高 ---
+    recent_high_idx = recent['close'].idxmax()
+    prior_high_idx = prior['close'].idxmax()
+    recent_high_price = recent.loc[recent_high_idx, 'close']
+    prior_high_price = prior.loc[prior_high_idx, 'close']
+    recent_high_rsi = recent.loc[recent_high_idx, 'rsi'] if 'rsi' in recent.columns else None
+    prior_high_rsi = prior.loc[prior_high_idx, 'rsi'] if 'rsi' in prior.columns else None
+    recent_high_macd = recent.loc[recent_high_idx, 'macd_hist'] if 'macd_hist' in recent.columns else None
+    prior_high_macd = prior.loc[prior_high_idx, 'macd_hist'] if 'macd_hist' in prior.columns else None
+
+    bearish_rsi_div = (pd.notna(recent_high_rsi) and pd.notna(prior_high_rsi)
+                        and recent_high_price > prior_high_price and recent_high_rsi < prior_high_rsi)
+    bearish_macd_div = (pd.notna(recent_high_macd) and pd.notna(prior_high_macd)
+                         and recent_high_price > prior_high_price and recent_high_macd < prior_high_macd)
+
+    signals = []
+    if bullish_rsi_div:
+        signals.append("RSI底背離")
+    if bullish_macd_div:
+        signals.append("MACD底背離")
+    if bearish_rsi_div:
+        signals.append("RSI頂背離")
+    if bearish_macd_div:
+        signals.append("MACD頂背離")
+
+    if not signals:
+        return {"divergence_signal": "無明顯背離",
+                "divergence_note": "近期價格與指標走勢方向一致，未偵測到底背離或頂背離"}
+
+    is_bullish = any("底背離" in s for s in signals)
+    is_bearish = any("頂背離" in s for s in signals)
+
+    if is_bullish and not is_bearish:
+        note = (f"偵測到{'/'.join(signals)}：股價創近期新低，但動能指標並未同步破底，"
+                "這是相對扎實的反轉預警訊號，但仍須配合成交量與後續K線確認，不代表立即反轉")
+    elif is_bearish and not is_bullish:
+        note = (f"偵測到{'/'.join(signals)}：股價創近期新高，但動能指標並未同步創高，"
+                "動能可能已經開始減弱，需留意漲勢是否後繼無力")
+    else:
+        note = f"同時偵測到底背離與頂背離訊號（{'/'.join(signals)}），訊號較為混雜，建議謹慎判讀"
+
+    return {"divergence_signal": "；".join(signals), "divergence_note": note}
+
+
+def detect_capitulation_signal(df_out: pd.DataFrame, candlestick_patterns: list) -> dict:
+    """
+    窒息量（量縮到極致）或爆量長下影線，都是市場實務上常見的落底訊號：
+    - 窒息量：成交量萎縮到近期相對低點，代表想賣的人跟想買的人都退場觀望，
+      是一種量能死寂的狀態，短線止跌機率較高
+    - 爆量長下影線：當天成交量異常放大，且K線出現長下影線（盤中重挫後又拉回），
+      代表買盤積極承接，是較強的單日反轉訊號
+    """
+    if 'volume' not in df_out.columns:
+        return {"capitulation_signal": None, "capitulation_note": "缺乏成交量資料，無法判斷"}
+
+    volume = df_out['volume']
+    latest_volume = volume.iloc[-1]
+    lookback = min(60, len(df_out))
+    history = volume.tail(lookback)
+
+    if len(history.dropna()) < 20:
+        return {"capitulation_signal": None, "capitulation_note": "資料不足，無法判斷窒息量或爆量狀態"}
+
+    # 目前量能落在近期歷史的百分位（越低代表量越萎縮，越高代表量越爆量）
+    volume_percentile = float((history <= latest_volume).mean() * 100)
+    has_long_lower_shadow = any(("鎚子線" in p or "長下影線" in p) for p in candlestick_patterns)
+
+    signals = []
+    if volume_percentile <= 15:
+        signals.append("窒息量")
+    if has_long_lower_shadow and volume_percentile >= 80:
+        signals.append("爆量長下影線")
+
+    if not signals:
+        return {
+            "capitulation_signal": "無明顯訊號",
+            "capitulation_note": f"目前量能約在近{lookback}日的{round(volume_percentile, 1)}百分位，未達窒息量或爆量長下影線的判斷門檻"
+        }
+
+    notes = []
+    if "窒息量" in signals:
+        notes.append(f"目前成交量處於近{lookback}日相對極低水準（約{round(volume_percentile, 1)}百分位），賣壓與買氣同步低迷，短線落底機率提高")
+    if "爆量長下影線" in signals:
+        notes.append(f"當天成交量異常放大（約{round(volume_percentile, 1)}百分位）且出現長下影線，顯示盤中重挫後有買盤積極承接，屬於較強的單日反轉訊號")
+
+    return {"capitulation_signal": "；".join(signals), "capitulation_note": "；".join(notes)}
+
+
+def analyze_volume_ma_rolloff(df_out: pd.DataFrame) -> dict:
+    """
+    量能均線「扣抵」判斷：均線是移動平均，隨著時間推進，最舊的一筆資料會被「扣掉」，
+    若扣掉的是相對高的量，代表就算之後量能持平，均線也會自然往下彎；
+    扣掉的是相對低的量，代表均線容易被墊高、往上彎。
+    這能提前判斷量能結構接下來要轉強還是轉弱，不用等到真的發生才知道。
+    """
+    if 'volume' not in df_out.columns:
+        return {}
+
+    volume = df_out['volume']
+    result = {}
+    for period, label in [(5, 'v_ma5'), (20, 'v_ma20')]:
+        if len(volume) < period + 1:
+            result[f'{label}_rolloff_note'] = f"資料不足，無法判斷{label}扣抵"
+            continue
+        rolloff_value = float(volume.iloc[-(period + 1)])  # 下一筆將被扣掉的量(即將滾出視窗的那一筆)
+        recent_avg = float(volume.tail(min(5, len(volume))).mean())  # 近期量能水準參考
+
+        if recent_avg <= 0:
+            result[f'{label}_rolloff_note'] = f"近期量能資料異常，無法判斷{label}扣抵"
+            continue
+
+        if rolloff_value > recent_avg * 1.15:
+            note = f"{label}下一筆將扣抵較高的量能（{rolloff_value:,.0f}），若接下來量能持平，{label}將自然向下彎，量能結構可能轉弱"
+        elif rolloff_value < recent_avg * 0.85:
+            note = f"{label}下一筆將扣抵較低的量能（{rolloff_value:,.0f}），若接下來量能持平，{label}將自然向上彎，量能結構可能轉強"
+        else:
+            note = f"{label}即將扣抵的量能（{rolloff_value:,.0f}）與近期水準相近，短期均線走向主要仍取決於接下來的實際量能變化"
+        result[f'{label}_rolloff_note'] = note
+    return result
 
 
 def determine_breakout_risk_warning(latest: pd.Series) -> Optional[str]:
@@ -766,6 +923,12 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         volume_price_info = analyze_volume_price_relation(df_out)
         band_squeeze_info = determine_band_squeeze(df_out)
 
+        # (6.5) 法人常看的進階指標：背離偵測、窒息量/爆量長下影線、量能扣抵
+        # （融資融券組合訊號、成交密集區估算兩項已依需求移除，不再計算）
+        divergence_info = detect_divergence(df_out)
+        capitulation_info = detect_capitulation_signal(df_out, candlestick_info.get('candlestick_patterns', []))
+        volume_rolloff_info = analyze_volume_ma_rolloff(df_out)
+
         # (7) 建議進場策略：根據趨勢位置給出「突破進場/拉回進場/現價可進場/觀望」的具體建議，
         # 取代單純把現價當成建議進場價的舊做法
         entry_strategy = suggest_entry_strategy(df_out.iloc[-1], trend_info, trade_levels.get('breakout_risk_warning'))
@@ -825,6 +988,9 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         latest_metrics.update(candlestick_info)
         latest_metrics.update(volume_price_info)
         latest_metrics.update(band_squeeze_info)
+        latest_metrics.update(divergence_info)
+        latest_metrics.update(capitulation_info)
+        latest_metrics.update(volume_rolloff_info)
         latest_metrics.update(entry_strategy)
 
         return {
