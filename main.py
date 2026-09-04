@@ -3,6 +3,7 @@ import sys
 import io
 import base64
 from typing import List, Optional
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -237,7 +238,7 @@ def read_root():
         # https://tsuntih-stock.zeabur.app/），
         # 看這裡的版本字串有沒有變成最新的，比每次都跑完整/analyze測試快很多，
         # 也能立刻判斷「到底是main.py沒改對，還是部署沒生效」。
-        "version": "2026-09-02-entry-basis-disclaimer"
+        "version": "2026-09-04-williams-bias-adx-bbwidth"
     }
 
 
@@ -405,6 +406,44 @@ def analyze_volume_price_relation(df_out: pd.DataFrame) -> dict:
         label, desc = "價量普通", "價格與量能變化都不明顯，暫無特殊量價訊號"
 
     return {"volume_price_label": label, "volume_price_desc": desc, "volume_ratio_vs_ma5": round(volume_ratio, 2)}
+
+
+def determine_band_squeeze(df_out: pd.DataFrame) -> dict:
+    """
+    判斷目前布林通道寬度(bb_width)是否處於「收縮(squeeze)」狀態——
+    也就是近期波動率相對過去而言明顯偏低。這種情況常常是變盤（大漲或大跌）前兆，
+    但收縮本身「不代表方向」，只代表接下來波動可能放大，須留意帶量突破的方向。
+    """
+    if 'bb_width' not in df_out.columns:
+        return {"bb_width": None, "bb_squeeze": None, "bb_squeeze_note": None}
+
+    current_width = df_out['bb_width'].iloc[-1]
+    if pd.isna(current_width):
+        return {"bb_width": None, "bb_squeeze": None, "bb_squeeze_note": "資料不足，無法判斷布林通道寬度"}
+
+    lookback = min(120, len(df_out))
+    history = df_out['bb_width'].tail(lookback).dropna()
+
+    if len(history) < 20:
+        return {
+            "bb_width": round(float(current_width), 2),
+            "bb_squeeze": None,
+            "bb_squeeze_note": "歷史資料不足20筆，無法判斷目前是否處於收縮狀態"
+        }
+
+    percentile_20 = float(np.percentile(history, 20))
+    is_squeeze = bool(current_width <= percentile_20)
+
+    if is_squeeze:
+        note = (
+            f"目前布林通道寬度({round(float(current_width), 2)}%)處於近{lookback}日相對低點"
+            f"（低於20百分位{round(percentile_20, 2)}%），波動率明顯收縮，是變盤前兆，"
+            "但收縮本身不代表方向，須留意帶量突破的實際方向再判斷"
+        )
+    else:
+        note = f"目前布林通道寬度({round(float(current_width), 2)}%)未處於收縮狀態，波動率屬正常範圍"
+
+    return {"bb_width": round(float(current_width), 2), "bb_squeeze": is_squeeze, "bb_squeeze_note": note}
 
 
 def determine_breakout_risk_warning(latest: pd.Series) -> Optional[str]:
@@ -725,6 +764,7 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         # (6) K線型態辨識 + 量價關係分析（規則型判斷，補強圖表視覺解讀的具體依據）
         candlestick_info = detect_candlestick_patterns(df_out)
         volume_price_info = analyze_volume_price_relation(df_out)
+        band_squeeze_info = determine_band_squeeze(df_out)
 
         # (7) 建議進場策略：根據趨勢位置給出「突破進場/拉回進場/現價可進場/觀望」的具體建議，
         # 取代單純把現價當成建議進場價的舊做法
@@ -784,6 +824,7 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         latest_metrics.update(trade_levels)
         latest_metrics.update(candlestick_info)
         latest_metrics.update(volume_price_info)
+        latest_metrics.update(band_squeeze_info)
         latest_metrics.update(entry_strategy)
 
         return {
