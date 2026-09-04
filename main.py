@@ -237,7 +237,7 @@ def read_root():
         # https://tsuntih-stock.zeabur.app/），
         # 看這裡的版本字串有沒有變成最新的，比每次都跑完整/analyze測試快很多，
         # 也能立刻判斷「到底是main.py沒改對，還是部署沒生效」。
-        "version": "2026-09-02-support-candidates-fix"
+        "version": "2026-09-02-entry-basis-disclaimer"
     }
 
 
@@ -729,6 +729,25 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         # (7) 建議進場策略：根據趨勢位置給出「突破進場/拉回進場/現價可進場/觀望」的具體建議，
         # 取代單純把現價當成建議進場價的舊做法
         entry_strategy = suggest_entry_strategy(df_out.iloc[-1], trend_info, trade_levels.get('breakout_risk_warning'))
+
+        # 🐛 修正：不管是「拉回進場」還是「突破進場」，只要 suggested_entry_type 不是
+        # 「現價可進場」，代表建議的實際進場價（suggested_entry_price）跟 stop_loss/
+        # target_price_1/2（永遠以「現價」為基準計算）用的是不同的假設進場點，
+        # 兩組數字彼此對不上——之前只在「趨勢偏空」時加過類似提醒，但這個問題其實
+        # 不限於偏空，中性/不明確、甚至拉回進場的情境下都會出現，這裡把範圍擴大到
+        # 只要 suggested_entry_type != 現價可進場 就一律加上提醒，涵蓋所有情境。
+        entry_basis_disclaimer = None
+        suggested_type = entry_strategy.get("suggested_entry_type")
+        if suggested_type and suggested_type != "現價可進場":
+            suggested_price = entry_strategy.get("suggested_entry_price")
+            price_desc = f"{suggested_price}" if suggested_price is not None else "建議價位"
+            entry_basis_disclaimer = (
+                f"注意：下方停損價／目標價①②是以「現價」{trade_levels.get('entry_price')}為基準計算的技術性試算，"
+                f"但建議進場策略是「{suggested_type}」（參考價約{price_desc}），兩者假設的進場點不同。"
+                f"若實際依建議等到{price_desc}附近才進場，屆時的停損／目標價應以那個實際進場價重新計算，"
+                "不等於下方列出的數字，僅供風控邏輯示範參考。"
+            )
+        entry_strategy["entry_basis_disclaimer"] = entry_basis_disclaimer
 
         # 5. 繪製圖表
         stock_label_parts = [p for p in [payload.stock_symbol, payload.stock_name] if p]
