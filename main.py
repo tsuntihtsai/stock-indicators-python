@@ -237,7 +237,7 @@ def read_root():
         # https://tsuntih-stock.zeabur.app/），
         # 看這裡的版本字串有沒有變成最新的，比每次都跑完整/analyze測試快很多，
         # 也能立刻判斷「到底是main.py沒改對，還是部署沒生效」。
-        "version": "2026-09-02-entry-strategy-suggestion"
+        "version": "2026-09-02-risk-zero-edgecase-fix"
     }
 
 
@@ -553,6 +553,17 @@ def calculate_trade_levels(df_out: pd.DataFrame, trend_info: Optional[dict] = No
     stop_loss = max(atr_stop, recent_low)
 
     risk = entry_price - stop_loss
+
+    # 🐛 修正邊界案例：如果近10日最低點剛好非常接近（甚至等於）現價，
+    # 常見於「今天正好創近10日新低、且收在最低點附近」的長黑棒（光頭光腳型態），
+    # 會導致 risk 趨近於0，讓 target_price_1／risk_reward_ratio 整組算不出來（回傳None，
+    # 報告上顯示成「無」）。這裡加一個最低風險距離（至少0.5倍ATR）的保底機制，
+    # 風險距離太小時改用純ATR停損，確保風控數字不會整組消失。
+    MIN_RISK = 0.5 * atr
+    if risk < MIN_RISK:
+        stop_loss = entry_price - max(1.5 * atr, MIN_RISK)
+        risk = entry_price - stop_loss
+
     target_price_1 = entry_price + 2 * risk if risk > 0 else None
 
     donchian_up = latest.get('donchian_up')
