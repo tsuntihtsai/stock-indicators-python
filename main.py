@@ -237,7 +237,7 @@ def read_root():
         # https://tsuntih-stock.zeabur.app/），
         # 看這裡的版本字串有沒有變成最新的，比每次都跑完整/analyze測試快很多，
         # 也能立刻判斷「到底是main.py沒改對，還是部署沒生效」。
-        "version": "2026-09-02-risk-zero-edgecase-fix"
+        "version": "2026-09-02-bearish-target-disclaimer"
     }
 
 
@@ -591,6 +591,18 @@ def calculate_trade_levels(df_out: pd.DataFrame, trend_info: Optional[dict] = No
 
     breakout_risk_warning = determine_breakout_risk_warning(latest)
 
+    # 🐛 修正：target_price_1/2 的計算邏輯，不管trend_bias是什麼，永遠是「假設現在做多」
+    # 情境下往上推算的目標價。這在趨勢偏空時會造成嚴重矛盾——報告一邊說「偏空、建議觀望/
+    # 拉回進場」，一邊卻列出一組現價往上漲25~30%的「目標價」，兩者互相打架，容易誤導。
+    # 這裡加一個明確的disclaimer欄位，讓Prompt在趨勢偏空時，把這組數字明確標示成
+    # 「假設性試算」而不是「目前建議的操作目標」。
+    target_price_disclaimer = None
+    if trend_info and trend_info.get("trend_bias") == "偏空":
+        target_price_disclaimer = (
+            "目前趨勢判斷為偏空，下面的目標價①/②是「假設現在做多」情境下的技術性風控試算，"
+            "並非目前建議追價進場的目標，偏空格局下不建議依此目標價做多操作。"
+        )
+
     note_parts = [
         "此為量化規則試算（entry_price=現價、停損=1.5倍ATR或近期低點、目標①=2倍風險反推、目標②=近期壓力位），"
         "僅供風控試算參考，非投資建議，entry_price不代表建議現在進場"
@@ -613,6 +625,7 @@ def calculate_trade_levels(df_out: pd.DataFrame, trend_info: Optional[dict] = No
         "risk_reward_ratio": risk_reward_ratio,
         "risk_reward_ratio_2": risk_reward_ratio_2,
         "breakout_risk_warning": breakout_risk_warning,
+        "target_price_disclaimer": target_price_disclaimer,
         "trade_note": "；".join(note_parts)
     }
 
