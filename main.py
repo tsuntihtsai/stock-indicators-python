@@ -273,7 +273,7 @@ def read_root():
         # https://tsuntih-stock.zeabur.app/），
         # 看這裡的版本字串有沒有變成最新的，比每次都跑完整/analyze測試快很多，
         # 也能立刻判斷「到底是main.py沒改對，還是部署沒生效」。
-        "version": "2026-09-04-divergence-capitulation-rolloff-only"
+        "version": "2026-09-22-divergence-capitulation-rolloff-only"
     }
 
 
