@@ -193,6 +193,41 @@ def determine_major_force(current_cmf: float, obv_status: str, payload: "Indicat
     }
 
 
+def determine_signal_divergence(trend_bias: str, major_force_status: str) -> dict:
+    """
+    trend_bias（技術面）與 major_force_status（籌碼面）是完全獨立計算的兩套分數，
+    suggest_entry_strategy() 只依據 trend_bias 決定策略，並未納入籌碼面方向。
+    當兩者方向相反時，策略建議只代表技術面單一視角，這裡明確標註出來，
+    避免使用者誤以為策略建議已經綜合考慮籌碼面。
+    """
+    bullish_trend = trend_bias == "偏多"
+    bearish_trend = trend_bias == "偏空"
+    bullish_chip = ("偏多" in major_force_status) or ("佈局" in major_force_status)
+    bearish_chip = ("偏空" in major_force_status) or ("撤離" in major_force_status)
+
+    if bullish_trend and bearish_chip:
+        return {
+            "signal_alignment": "背離（技術偏多／籌碼偏空）",
+            "signal_alignment_note": (
+                "⚠️ 訊號分歧提醒：技術面指標顯示偏多，但籌碼面（三大法人）同步顯示主力偏空撤離。"
+                "上方的策略建議僅依據技術面計算，並未納入籌碼面方向。"
+                "籌碼面轉向常領先技術面反應，此類分歧格局追價風險較高，"
+                "建議降低部位規模、縮小停損距離，或等待籌碼面轉為同向後再考慮進場。"
+            )
+        }
+    elif bearish_trend and bullish_chip:
+        return {
+            "signal_alignment": "背離（技術偏空／籌碼偏多）",
+            "signal_alignment_note": (
+                "⚠️ 訊號分歧提醒：技術面指標顯示偏空，但籌碼面（三大法人）同步顯示主力偏多佈局。"
+                "可能代表法人正在逢低承接、但短線技術指標尚未反映，"
+                "上方策略建議僅依據技術面計算，不宜單純依此判斷做空。"
+            )
+        }
+    else:
+        return {"signal_alignment": "一致或中性", "signal_alignment_note": None}
+        
+
 class IndicatorRequestFM(BaseModel):
     data: List[OHLCVFM]
     stock_symbol: Optional[str] = Field(default=None, description="股票代號，例如 2330")
@@ -627,7 +662,8 @@ def determine_breakout_risk_warning(latest: pd.Series) -> Optional[str]:
     return None
 
 
-def suggest_entry_strategy(latest: pd.Series, trend_info: dict, breakout_warning: Optional[str]) -> dict:
+def suggest_entry_strategy(latest: pd.Series, trend_info: dict, breakout_warning: Optional[str],
+                            stop_loss: Optional[float] = None, atr: Optional[float] = None) -> dict:
     """
     給出一個「真正有分析含量」的建議進場價/策略，取代單純把現價當成進場價的舊做法。
 
@@ -636,8 +672,9 @@ def suggest_entry_strategy(latest: pd.Series, trend_info: dict, breakout_warning
     2. 拉回進場：指標過熱/死叉，或趨勢中性不明確 → 建議「拉回到OO支撐不破再進場」，不追高
     3. 現價可進場：趨勢偏多，且已經站穩主要壓力之上、也沒有過熱警訊 → 現價才真正具備進場條件
 
-    這仍然是規則型判斷，不是預測，也不保證進場後一定獲利，只是把「什麼情況下才建議進場」
-    講得比「現價=建議進場價」更有依據、更誠實。
+    stop_loss / atr 用來檢查算出來的支撐候選價位是否跟停損價過於接近。
+    如果兩者距離小於 0.5倍ATR（甚至相等），代表這個支撐候選本身就是最近的支撐關卡，
+    等到那個價位進場時幾乎沒有回檔容錯空間，會在建議文字裡明確警示。
     """
     close = float(latest['close'])
     bb_mid = latest.get('bb_mid')
@@ -656,41 +693,57 @@ def suggest_entry_strategy(latest: pd.Series, trend_info: dict, breakout_warning
         _clean, [bb_mid, bb_up, bb_low, donchian_up, donchian_low, ma5, ma20]
     )
 
-    # 情況1：指標過熱/死叉 → 不建議追高，改建議等拉回
-    # 🐛 修正：原本只考慮 ma5/ma20/bb_mid 當支撐候選，股價強烈下跌、
-    # 已經跌破所有均線時（例如剛出現長黑棒重挫），這三個候選可能全部高於現價、
-    # 一個都選不到，導致「建議進場價」變成完全空白（只顯示「支撐區」這種空話）。
-    # 這裡把 bb_low（布林下軌）、donchian_low（20日低點）也納入候選，
-    # 確保股價已經跌破短期均線時，還有更下方的支撐關卡可以參考。
+    min_buffer = 0.5 * atr if (atr is not None and atr > 0) else 0.0
+
+    def _too_close_to_stop(price):
+        if price is None or stop_loss is None:
+            return False
+        return abs(price - stop_loss) < min_buffer
+
+    def _build_pullback_result(pullback_ref, entry_type_label, base_note):
+        note = base_note
+        if _too_close_to_stop(pullback_ref):
+            note += (
+                f"（⚠️ 注意：此進場參考價 {round(pullback_ref, 2)} 已非常接近建議停損價 "
+                f"{round(stop_loss, 2)}，兩者相距不到0.5倍ATR，實際進場後容錯空間極小，"
+                "建議搭配更寬鬆的停損設定，或改以更保守的支撐位分批進場，避免一有正常波動就被洗出場)"
+            )
+        return {
+            "suggested_entry_type": entry_type_label,
+            "suggested_entry_price": round(pullback_ref, 2) if pullback_ref is not None else None,
+            "suggested_entry_note": note
+        }
+
     if breakout_warning:
         support_candidates = [v for v in [ma5, ma20, bb_mid, bb_low, donchian_low] if v is not None and v < close]
         pullback_ref = max(support_candidates) if support_candidates else None
-        return {
-            "suggested_entry_type": "拉回進場",
-            "suggested_entry_price": round(pullback_ref, 2) if pullback_ref is not None else None,
-            "suggested_entry_note": (
-                f"指標已偏向過熱/死叉，不建議現在追高，建議等股價拉回至約 {round(pullback_ref, 2) if pullback_ref is not None else '支撐區'} 附近且不破，再考慮進場"
-            )
-        }
+        base_note = (
+            f"指標已偏向過熱/死叉，不建議現在追高，建議等股價拉回至約 "
+            f"{round(pullback_ref, 2) if pullback_ref is not None else '支撐區'} 附近且不破，再考慮進場"
+        )
+        return _build_pullback_result(pullback_ref, "拉回進場", base_note)
 
-    # 情況2：趨勢偏多，但還沒站上關鍵壓力 → 建議站上壓力再進場（突破進場）
     if trend_bias == "偏多":
         resistance_candidates = [v for v in [bb_up, donchian_up] if v is not None and v > close]
         if resistance_candidates:
             trigger = min(resistance_candidates)
+            note = f"若股價帶量站穩 {round(trigger, 2)} 之上，可視為偏多訊號進場；目前尚未站上此關卡，不建議現在追價"
+            if _too_close_to_stop(trigger):
+                note += (
+                    f"（⚠️ 注意：此突破觸發價 {round(trigger, 2)} 與建議停損價 {round(stop_loss, 2)} 相距過近，"
+                    "實際站上後的合理停損可能需要另外評估，不宜直接沿用下方停損數字)"
+                )
             return {
                 "suggested_entry_type": "突破進場",
                 "suggested_entry_price": round(trigger, 2),
-                "suggested_entry_note": f"若股價帶量站穩 {round(trigger, 2)} 之上，可視為偏多訊號進場；目前尚未站上此關卡，不建議現在追價"
+                "suggested_entry_note": note
             }
-        # 情況3：已經站穩所有壓力之上，趨勢偏多又沒有過熱警訊 → 現價才真正具備進場條件
         return {
             "suggested_entry_type": "現價可進場",
             "suggested_entry_price": round(close, 2),
             "suggested_entry_note": "股價已站穩主要壓力關卡之上，趨勢偏多且無即時過熱疑慮，現價具備進場條件（仍請自行搭配停損執行）"
         }
 
-    # 情況4：趨勢偏空 → 不建議做多進場
     if trend_bias == "偏空":
         return {
             "suggested_entry_type": "觀望",
@@ -698,17 +751,15 @@ def suggest_entry_strategy(latest: pd.Series, trend_info: dict, breakout_warning
             "suggested_entry_note": "目前趨勢偏空，不建議進場做多，請等待止跌訊號出現後再評估"
         }
 
-    # 情況5：中性/不明確 → 建議等拉回或等訊號更明確（同樣加入bb_low/donchian_low當候選）
     support_candidates = [v for v in [ma20, bb_mid, bb_low, donchian_low] if v is not None and v < close]
     pullback_ref = max(support_candidates) if support_candidates else None
-    return {
-        "suggested_entry_type": "觀望/等待轉折",
-        "suggested_entry_price": round(pullback_ref, 2) if pullback_ref is not None else None,
-        "suggested_entry_note": (
-            f"目前趨勢不明確，建議等股價拉回至約 {round(pullback_ref, 2) if pullback_ref is not None else '支撐區'} "
-            "或出現更明確的轉折訊號後，再考慮進場"
-        )
-    }
+    base_note = (
+        f"目前趨勢不明確，建議等股價拉回至約 "
+        f"{round(pullback_ref, 2) if pullback_ref is not None else '支撐區'} "
+        "或出現更明確的轉折訊號後，再考慮進場"
+    )
+    return _build_pullback_result(pullback_ref, "觀望/等待轉折", base_note)
+                                
 
 
 def calculate_trade_levels(df_out: pd.DataFrame, trend_info: Optional[dict] = None) -> dict:
@@ -931,8 +982,14 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
 
         # (7) 建議進場策略：根據趨勢位置給出「突破進場/拉回進場/現價可進場/觀望」的具體建議，
         # 取代單純把現價當成建議進場價的舊做法
-        entry_strategy = suggest_entry_strategy(df_out.iloc[-1], trend_info, trade_levels.get('breakout_risk_warning'))
-
+        entry_strategy = suggest_entry_strategy(
+                                                df_out.iloc[-1],
+                                                trend_info,
+                                                trade_levels.get('breakout_risk_warning'),
+                                                stop_loss=trade_levels.get('stop_loss'),
+                                                atr=float(df_out.iloc[-1].get('atr')) if pd.notna(df_out.iloc[-1].get('atr')) else None
+        )
+        
         # 🐛 修正：不管是「拉回進場」還是「突破進場」，只要 suggested_entry_type 不是
         # 「現價可進場」，代表建議的實際進場價（suggested_entry_price）跟 stop_loss/
         # target_price_1/2（永遠以「現價」為基準計算）用的是不同的假設進場點，
@@ -952,6 +1009,24 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
             )
         entry_strategy["entry_basis_disclaimer"] = entry_basis_disclaimer
 
+        # 目標價②（近期壓力關卡）跟「突破進場」的觸發價，常常抓的是同一個技術關卡（例如唐奇安上軌），
+        # 若兩者相同或target_price_2更低，代表依建議等站穩此關卡才進場時，目標價②可能已經達成或被超過，
+        # 此目標對突破進場策略幾乎無獲利空間，需明確提醒。
+        if (suggested_type == "突破進場"
+                and entry_strategy.get("suggested_entry_price") is not None
+                and trade_levels.get("target_price_2") is not None
+                and trade_levels["target_price_2"] <= entry_strategy["suggested_entry_price"]):
+            extra_note = (
+                f"⚠️ 目標價②（{trade_levels['target_price_2']}）與建議突破進場觸發價"
+                f"（{entry_strategy['suggested_entry_price']}）相同或更低，"
+                "代表若依「站穩此關卡才進場」的策略執行，實際進場時可能已達成或超過目標價②，"
+                "此目標對突破進場策略幾乎無獲利空間，建議以目標價①作為主要參考，"
+                "或等待更上方的壓力關卡出現後再重新評估目標價。"
+            )
+            existing = trade_levels.get("target_price_disclaimer")
+            trade_levels["target_price_disclaimer"] = (existing + "；" + extra_note) if existing else extra_note
+                    
+        signal_divergence_info = determine_signal_divergence(trend_info.get("trend_bias"),chip_info.get("major_force_status"))     
         # 5. 繪製圖表
         stock_label_parts = [p for p in [payload.stock_symbol, payload.stock_name] if p]
         stock_label = " ".join(stock_label_parts)
@@ -992,6 +1067,7 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         latest_metrics.update(capitulation_info)
         latest_metrics.update(volume_rolloff_info)
         latest_metrics.update(entry_strategy)
+        latest_metrics.update(signal_divergence_info)
 
         return {
             "status": "success",
