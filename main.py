@@ -1161,6 +1161,8 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         capitulation_info = detect_capitulation_signal(df_out, candlestick_info.get('candlestick_patterns', []))
         volume_rolloff_info = analyze_volume_ma_rolloff(df_out)
 
+        bullish_reversal_info = detect_bullish_reversal(df_out)
+
         # (7) 建議進場策略：根據趨勢位置給出「突破進場/拉回進場/現價可進場/觀望」的具體建議，
         # 取代單純把現價當成建議進場價的舊做法
         entry_strategy = suggest_entry_strategy(
@@ -1247,6 +1249,7 @@ def analyze_stock_v3(payload: IndicatorRequestFM):
         latest_metrics.update(divergence_info)
         latest_metrics.update(capitulation_info)
         latest_metrics.update(volume_rolloff_info)
+        latest_metrics.update(bullish_reversal_info)
         latest_metrics.update(entry_strategy)
         latest_metrics.update(signal_divergence_info)
 
