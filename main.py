@@ -637,6 +637,187 @@ def analyze_volume_ma_rolloff(df_out: pd.DataFrame) -> dict:
         result[f'{label}_rolloff_note'] = note
     return result
 
+def detect_bullish_reversal(df_out: pd.DataFrame,
+                            lookback: int = 60,
+                            min_base_bars: int = 5,
+                            min_drop_pct: float = 10.0,
+                            max_base_rebound_pct: float = 25.0,
+                            min_gain_pct: float = 2.0,
+                            min_body_ratio: float = 0.6,
+                            surge_volume_ratio: float = 1.5,
+                            base_volume_ratio: float = 1.5) -> dict:
+    """
+    底部反轉多頭確認訊號（規則型簡化版，以最新一根日K為「確認日」）。
+
+    必要條件：
+    1. 空頭下跌後在低檔打底（前高到低點跌幅>=min_drop_pct，低點後盤整>=min_base_bars根）
+    2. 確認日收盤突破打底區間的轉折高點（頸線）
+    3. 確認日為實體長紅，漲幅>=min_gain_pct，且成交量>=前5日均量的surge_volume_ratio倍
+    4. 均線條件：完整版（收盤在5/10/20日線之上、多頭排列、三線向上）
+       或較弱版（收盤在20日線之上且20日線上揚）
+
+    加分項（不影響是否成立，只提高可信度）：底部放量、KD向上、MACD動能改善。
+
+    注意：「打底」「轉折高點」本來就帶有主觀成分，這裡用固定規則簡化，
+    實際抓到的型態可能跟人眼判讀有出入，建議用歷史案例回測後再調參數。
+    """
+    no_data = {
+        "bullish_reversal_signal": None,
+        "bullish_reversal_note": "資料不足，無法判斷底部反轉訊號",
+        "bullish_reversal_bonus": [],
+        "bullish_reversal_unmet": [],
+        "bullish_reversal_details": {},
+    }
+    if len(df_out) < 30:
+        return no_data
+
+    df = df_out.copy()
+    for p in (5, 10, 20):
+        if f'ma_{p}' not in df.columns:
+            df[f'ma_{p}'] = df['close'].rolling(p).mean()
+
+    w = df.tail(min(lookback, len(df)))
+    last = len(w) - 1
+    if last < min_base_bars + 3:
+        return no_data
+
+    close = w['close'].to_numpy(dtype=float)
+    open_ = w['open'].to_numpy(dtype=float)
+    high = w['high'].to_numpy(dtype=float)
+    low = w['low'].to_numpy(dtype=float)
+    vol = w['volume'].to_numpy(dtype=float)
+    if np.isnan(close).any() or np.isnan(vol).any():
+        return no_data
+
+    def _valid(*vals):
+        return all(v is not None and not np.isnan(v) for v in vals)
+
+    # ---------- 1. 打底判斷 ----------
+    low_pos = int(np.argmin(close[:last]))           # 最低收盤（不含今天）
+    low_close = float(close[low_pos])
+    base_bars = last - low_pos - 1                   # 低點後到昨天的盤整根數
+
+    prior_high = float(np.max(close[:low_pos])) if low_pos > 0 else None
+    drop_pct = (prior_high - low_close) / prior_high * 100 if prior_high else None
+    drop_ok = bool(drop_pct is not None and drop_pct >= min_drop_pct)
+    base_bars_ok = bool(base_bars >= min_base_bars)
+
+    neckline = float(np.max(close[low_pos + 1:last])) if base_bars >= 1 else None
+    rebound_pct = (neckline - low_close) / low_close * 100 if neckline else None
+    rebound_ok = bool(rebound_pct is not None and rebound_pct <= max_base_rebound_pct)
+
+    # ---------- 2. 突破頸線 ----------
+    c = float(close[last])
+    o = float(open_[last])
+    h = float(high[last])
+    l = float(low[last])
+    prev_c = float(close[last - 1])
+    breakout_ok = bool(neckline is not None and c > neckline)
+
+    # ---------- 3. 確認日K棒 ----------
+    body_ratio = (c - o) / max(h - l, 1e-4)
+    gain_pct = (c - prev_c) / prev_c * 100
+    red_ok = bool(c > o and body_ratio >= min_body_ratio)
+    gain_ok = bool(gain_pct >= min_gain_pct)
+
+    avg_prior5 = float(np.mean(vol[last - 5:last]))
+    vol_ratio = float(vol[last]) / avg_prior5 if avg_prior5 > 0 else None
+    volume_ok = bool(vol_ratio is not None and vol_ratio >= surge_volume_ratio)
+
+    # ---------- 4. 均線條件 ----------
+    ma5 = w['ma_5'].to_numpy(dtype=float)
+    ma10 = w['ma_10'].to_numpy(dtype=float)
+    ma20 = w['ma_20'].to_numpy(dtype=float)
+    strong_ma = weak_ma = False
+    if _valid(ma5[last], ma5[last - 1], ma10[last], ma10[last - 1], ma20[last], ma20[last - 1]):
+        above_all = c > ma5[last] and c > ma10[last] and c > ma20[last]
+        aligned = ma5[last] > ma10[last] > ma20[last]
+        rising = (ma5[last] > ma5[last - 1] and ma10[last] > ma10[last - 1]
+                  and ma20[last] > ma20[last - 1])
+        strong_ma = bool(above_all and aligned and rising)
+        weak_ma = bool(c > ma20[last] and ma20[last] > ma20[last - 1])
+
+    # ---------- 加分項 ----------
+    bonus = []
+    base_zone = vol[max(0, low_pos - 2):last]
+    window_avg_vol = float(np.mean(vol[:last]))
+    base_vol_ratio = float(np.max(base_zone)) / window_avg_vol if window_avg_vol > 0 else None
+    if base_vol_ratio is not None and base_vol_ratio >= base_volume_ratio:
+        bonus.append(f"底部明顯放量（區間最大量為均量{base_vol_ratio:.1f}倍）")
+
+    def _last_two(col):
+        if col not in w.columns:
+            return None, None
+        s = w[col].to_numpy(dtype=float)
+        return float(s[last]), float(s[last - 1])
+
+    k, k_prev = _last_two('%k')
+    d, d_prev = _last_two('%d')
+    if _valid(k, k_prev, d, d_prev) and k > k_prev:
+        if k > d and d >= d_prev:
+            bonus.append("KD多頭排列向上")
+        else:
+            bonus.append("KD的K值向上走高")
+
+    hist, hist_prev = _last_two('macd_hist')
+    if _valid(hist, hist_prev) and hist > hist_prev:
+        if hist > 0 and hist_prev > 0:
+            bonus.append("MACD紅柱延長")
+        elif hist > 0:
+            bonus.append("MACD綠翻紅")
+        else:
+            bonus.append("MACD綠柱縮短")
+
+    # ---------- 綜合判定 ----------
+    core_checks = [
+        (f"空頭下跌段不足（前高到低點跌幅需>={min_drop_pct}%）", drop_ok),
+        (f"低點後盤整不足{min_base_bars}根K棒", base_bars_ok),
+        (f"打底期間反彈幅度過大（超過{max_base_rebound_pct}%，較像已經上漲而非打底）", rebound_ok),
+        ("收盤尚未突破打底區間轉折高點", breakout_ok),
+        (f"非實體長紅（需紅K且實體佔比>={int(min_body_ratio * 100)}%）", red_ok),
+        (f"漲幅未達{min_gain_pct}%", gain_ok),
+        (f"成交量未達前5日均量{surge_volume_ratio}倍", volume_ok),
+    ]
+    unmet = [label for label, ok in core_checks if not ok]
+    core_ok = len(unmet) == 0
+
+    signal = None
+    if core_ok and strong_ma:
+        signal = "底部反轉多頭確認（完整）"
+    elif core_ok and weak_ma:
+        signal = "底部反轉多頭確認（均線條件較弱）"
+    elif core_ok:
+        unmet.append("均線條件未達（收盤需在20日線之上且20日線上揚）")
+
+    details = {
+        "bottom_close": round(low_close, 2),
+        "base_bars": int(base_bars),
+        "neckline": round(neckline, 2) if neckline is not None else None,
+        "gain_pct": round(gain_pct, 2),
+        "body_ratio": round(body_ratio, 2),
+        "volume_ratio_vs_prior5": round(vol_ratio, 2) if vol_ratio is not None else None,
+    }
+
+    if signal:
+        ma_desc = ("收盤站上5/10/20日線，三線多頭排列且向上" if strong_ma
+                   else "收盤站上20日線且20日線上揚，但5/10/20日線尚未完整多頭排列")
+        note = (f"{signal}：低點{details['bottom_close']}後盤整{base_bars}根K棒，"
+                f"今日收盤{c}突破轉折高點{details['neckline']}，漲幅{gain_pct:.2f}%，"
+                f"實體佔比{body_ratio:.0%}，成交量為前5日均量{vol_ratio:.2f}倍。{ma_desc}。"
+                + (f"加分項：{'、'.join(bonus)}。" if bonus else "加分項：無。")
+                + "此為規則型技術訊號，仍需自行搭配停損與籌碼面判斷。")
+    else:
+        note = "目前未同時符合底部反轉多頭確認條件"
+
+    return {
+        "bullish_reversal_signal": signal,
+        "bullish_reversal_note": note,
+        "bullish_reversal_bonus": bonus,
+        "bullish_reversal_unmet": unmet,
+        "bullish_reversal_details": details,
+    }
+
+
 
 def determine_breakout_risk_warning(latest: pd.Series) -> Optional[str]:
     """
